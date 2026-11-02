@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from PIL import Image
 from song_collector_gui import SongCollector, SongCollectorApp
+from media_library import WorkingLibrary
 
 
 class GuiTests(unittest.TestCase):
@@ -16,11 +17,13 @@ class GuiTests(unittest.TestCase):
         from ttkbootstrap.utility import enable_high_dpi_awareness
         enable_high_dpi_awareness()
         cls.root = tk.Tk()
-        cls.app = SongCollectorApp(cls.root)
+        cls.project = tempfile.TemporaryDirectory()
+        cls.app = SongCollectorApp(cls.root, project_root=Path(cls.project.name))
 
     @classmethod
     def tearDownClass(cls):
         cls.root.destroy()
+        cls.project.cleanup()
 
     def setUp(self):
         self.app._close_dialog()
@@ -67,7 +70,9 @@ class GuiTests(unittest.TestCase):
         self.root.update()
         self.assertEqual(song.title, 'Edited')
         self.assertEqual(self.app.detail_title.cget('text'), 'Edited')
-        self.assertTrue(self.app.dirty)
+        self.assertFalse(self.app.dirty)
+        reopened = self.app.library.read(self.app.library.path, SongCollector)
+        self.assertEqual(reopened.get_song_by_id(song.id).title, 'Edited')
 
     def test_filter_sort_selection_and_delete(self):
         first = self.add_song('Zulu', 'ABBA')
@@ -117,7 +122,7 @@ class GuiTests(unittest.TestCase):
                 self.app.save_library()
             self.assertFalse(self.app.dirty)
             self.app.collector.remove_song_by_id(song.id)
-            self.app._mark_changed()
+            self.app.dirty = True  # simulate changes retained after a failed autosave
             with patch('song_collector_gui.messagebox.askyesno', return_value=False), patch('song_collector_gui.filedialog.askopenfilename') as picker:
                 self.app.load_library()
                 picker.assert_not_called()
@@ -132,6 +137,140 @@ class GuiTests(unittest.TestCase):
         with patch('song_collector_gui.messagebox.showinfo') as info:
             self.app.show_stats()
             self.assertIn('Pop: 1', info.call_args.args[1])
+
+    def test_autosave_failure_keeps_edits_dirty_and_reports_error(self):
+        self.app.library.save(self.app.collector)
+        before = self.app.library.path.read_bytes()
+        self.app.open_song_dialog()
+        self.app.var_title.set('Retained after failure')
+        self.app.var_artist.set('Artist')
+        with patch('media_library.os.replace', side_effect=PermissionError('locked')), patch('song_collector_gui.messagebox.showerror') as error:
+            self.app.add_song()
+            error.assert_called_once()
+        self.assertTrue(self.app.dirty)
+        self.assertEqual(self.app.collector.list_songs()[0].title, 'Retained after failure')
+        self.assertEqual(self.app.library.path.read_bytes(), before)
+        self.assertTrue(self.app._autosave())
+        self.assertFalse(self.app.dirty)
+
+    def test_delete_is_automatically_saved(self):
+        song = self.add_song()
+        self.app._mark_changed()
+        self.app.tree.selection_set(str(song.id))
+        with patch('song_collector_gui.messagebox.askyesno', return_value=True):
+            self.app.delete_selected()
+        reopened = self.app.library.read(self.app.library.path, SongCollector)
+        self.assertEqual(reopened.list_songs(), [])
+        self.assertFalse(self.app.dirty)
+
+    def test_browse_external_copy_link_and_cancel(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / 'external.mp3'
+            source.write_bytes(b'original audio')
+            with patch('song_collector_gui.filedialog.askopenfilename', return_value=str(source)), patch('song_collector_gui.messagebox.askyesnocancel', return_value=True):
+                self.app.browse_audio()
+            reference = self.app.var_filepath.get()
+            self.assertTrue(reference.startswith('media/audio/'))
+            self.assertEqual((self.app.library.media.root / reference).read_bytes(), source.read_bytes())
+            with patch('song_collector_gui.messagebox.askyesnocancel', return_value=None):
+                self.app._set_browsed_media(source, 'audio', self.app.var_filepath)
+            self.assertEqual(self.app.var_filepath.get(), reference)
+            with patch('song_collector_gui.messagebox.askyesnocancel', return_value=False):
+                self.app._set_browsed_media(source, 'audio', self.app.var_filepath)
+            self.assertEqual(Path(self.app.var_filepath.get()), source)
+            self.assertTrue(source.exists())
+
+    def test_relative_playback_and_cover_preview_from_other_directory(self):
+        import os
+        project = self.app.library.media.root
+        audio = project / 'relative.mp3'
+        audio.touch()
+        cover = project / 'relative.png'
+        Image.new('RGB', (20, 20), 'orange').save(cover)
+        song = self.add_song()
+        song.filepath = 'relative.mp3'
+        song.cover_path = 'relative.png'
+        self.app.tree.selection_set(str(song.id))
+        previous = Path.cwd()
+        with tempfile.TemporaryDirectory() as folder:
+            try:
+                os.chdir(folder)
+                self.app.on_song_selected()
+                self.assertIsNotNone(self.app.cover_image)
+                with patch('song_collector_gui.os.startfile', create=True) as player:
+                    self.app.play_selected()
+                    player.assert_called_once_with(str(audio))
+            finally:
+                os.chdir(previous)
+
+    def test_invalid_import_preserves_current_songs_and_disk(self):
+        song = self.add_song()
+        self.app._mark_changed()
+        before = self.app.library.path.read_bytes()
+        with tempfile.TemporaryDirectory() as folder:
+            bad = Path(folder) / 'bad.json'
+            bad.write_text('{broken', encoding='utf-8')
+            with patch('song_collector_gui.filedialog.askopenfilename', return_value=str(bad)), patch('song_collector_gui.messagebox.showerror') as error:
+                self.app.load_library()
+                error.assert_called_once()
+            self.assertEqual(self.app.collector.list_songs(), [song])
+            self.assertEqual(self.app.library.path.read_bytes(), before)
+
+    def test_export_after_save_failure_does_not_hide_unsaved_state(self):
+        self.add_song()
+        self.app.dirty = True
+        with tempfile.TemporaryDirectory() as folder:
+            export = Path(folder) / 'rescue.json'
+            with patch('song_collector_gui.filedialog.asksaveasfilename', return_value=str(export)):
+                self.app.save_library()
+            self.assertTrue(export.exists())
+            self.assertTrue(self.app.dirty)
+
+    def test_startup_reopens_automatically_saved_songs(self):
+        song = self.add_song('Reopened title', 'Artist')
+        self.app._mark_changed()
+        self.app.collector = SongCollector()
+        self.app._load_working_library()
+        self.assertEqual(self.app.collector.get_song_by_id(song.id).title, 'Reopened title')
+
+    def test_corrupt_startup_pauses_writes_and_preserves_file(self):
+        previous_store = self.app.library
+        with tempfile.TemporaryDirectory() as folder:
+            store = WorkingLibrary(folder)
+            store.path.parent.mkdir()
+            store.path.write_bytes(b'{corrupt')
+            try:
+                self.app.library = store
+                self.app.collector = SongCollector()
+                with patch('song_collector_gui.messagebox.showerror') as error:
+                    self.app._load_working_library()
+                    error.assert_called_once()
+                    self.app.collector.add_song('Recovery', 'Artist', 1, '', 1, '', '')
+                    self.app._mark_changed()
+                self.assertTrue(self.app.dirty)
+                self.assertTrue(store.blocked)
+                self.assertEqual(store.path.read_bytes(), b'{corrupt')
+            finally:
+                self.app.library = previous_store
+
+    def test_first_startup_save_failure_retains_migrated_songs_for_retry(self):
+        previous_store = self.app.library
+        with tempfile.TemporaryDirectory() as folder:
+            store = WorkingLibrary(folder)
+            sample = Path(__file__).resolve().parents[1] / 'My Favourite Library.json'
+            store.original.write_bytes(sample.read_bytes())
+            try:
+                self.app.library = store
+                self.app.collector = SongCollector()
+                with patch('media_library.os.replace', side_effect=PermissionError('locked')), patch('song_collector_gui.messagebox.showerror'):
+                    self.app._load_working_library()
+                self.assertTrue(self.app.dirty)
+                self.assertEqual(len(self.app.collector.list_songs()), 8)
+                self.assertFalse(store.path.exists())
+                self.assertTrue(self.app._autosave())
+                self.assertEqual(len(store.read(store.path, SongCollector).list_songs()), 8)
+            finally:
+                self.app.library = previous_store
 
     def test_cancel_edit_keeps_original(self):
         song = self.add_song()

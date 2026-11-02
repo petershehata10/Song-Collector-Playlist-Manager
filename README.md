@@ -1,6 +1,6 @@
 # Smart Song Collector & Playlist Manager
 
-A local Windows desktop music library built with Python and Tkinter. Phase 1 modernizes the GUI while retaining the existing Song / SongCollector model and JSON library format. Playlist creation and management are outside this phase.
+A local Windows desktop music library built with Python and Tkinter. Phase 1 modernized the GUI; Phase 2 adds project-local media references, automatic loading, and safe automatic saving while retaining the Song / SongCollector model and JSON library format. Playlist creation and management are outside this phase.
 
 ## Setup and run (PowerShell)
 
@@ -24,16 +24,20 @@ Dependencies are pinned in `requirements.txt`: ttkbootstrap 1.20.4 provides mode
 
 ## Using the library
 
-- The sidebar opens the library, displays genre counts, saves/loads JSON, and switches appearance. Only implemented actions are shown.
+- The sidebar opens the library, displays genre counts, imports/exports JSON, and switches appearance. Only implemented actions are shown.
 - Add songs with **Add song**. Edit a single selection with **Edit song** or by double-clicking its row. Title and artist are required; enter a non-negative integer duration in seconds and an integer rating from 1 to 5. Audio and cover paths are optional.
 - Search title/artist words using **Search** or Enter. This retains the existing whole-word similarity search, so partial words such as `danc` do not match `Dancing`. Clear restores the full collection. Sorting preserves the active search; rating sorts highest first, duration shortest first.
 - Use Ctrl/Shift selection for several rows. Play selected, play all, or choose a random song. Playback uses the Windows default player; multiple files are passed through a temporary M3U as before. Player support determines queue behavior.
 - The inspector shows the selected song, a bounded cover preview, and audio-file availability. Common Pillow image formats work; PNG remains supported.
 - Removing songs only removes their library records. It never deletes audio or cover files.
-- Save/load is manual. An unsaved-changes indicator and confirmation before replacing/closing the library help prevent accidental loss. Save a copy under a new JSON filename to retain the original library.
-- The bundled `My Favourite Library.json` uses absolute paths from an older directory. Load it to see the metadata, then edit/browse to reconnect audio and covers if needed. The application does not rewrite these paths automatically.
+- The app automatically opens `data/library.json` at startup and saves after successful add, edit, delete, and JSON import operations. The footer reports success or unsaved changes.
+- On first startup, if the working file does not exist, the bundled `My Favourite Library.json` is imported. Old absolute Windows paths are matched by filename to existing root media, with IDs, metadata, and the next ID retained. The original JSON and root media are never rewritten or moved. If neither JSON exists, an empty working library is created.
+- **Import library…** replaces the displayed collection and automatically saves it to the working file. It does not modify the source JSON. Failed imports keep the current collection. If there are unsaved changes after a save failure, replacing them requires confirmation.
+- **Export library…** writes a JSON copy to a chosen filename. Exporting never changes the working location. An export cannot overwrite the original `My Favourite Library.json` or use a non-JSON filename. Exporting a recovery copy does not hide a failed working save.
+- Browse external audio or covers and choose **Yes** to copy into `media/audio` or `media/covers`, **No** to keep an absolute link, or **Cancel** to leave the field unchanged. Name collisions use `name (2).ext`, `name (3).ext`, etc.; existing files and originals are kept. Files already in the project are referenced in place. Copying occurs when browsing; cancelling the song dialog afterwards leaves the copy in place.
+- Missing media keeps its path and metadata. The inspector shows missing audio and unavailable cover images; use Edit to reconnect files.
 
-Keyboard: Ctrl+N adds, Ctrl+F focuses search, Ctrl+S saves, Ctrl+O loads; Delete removes selected table rows with confirmation. Escape cancels an add/edit dialog; Ctrl+Enter submits it. Tab moves through controls.
+Keyboard: Ctrl+N adds, Ctrl+F focuses search, Ctrl+S exports, Ctrl+O imports; Delete removes selected table rows with confirmation. Escape cancels an add/edit dialog; Ctrl+Enter submits it. Tab moves through controls.
 
 ## Design and implementation
 
@@ -41,24 +45,61 @@ The default dark palette uses background `#171D24`, surface `#252E38`, accent `#
 
 A compact sidebar, resizable center table, and right-hand song inspector replace the permanent input form. The window supports 1040×680 and larger; horizontal/vertical table scrollbars keep columns accessible at smaller widths. The inspector scrolls vertically to accommodate longer song details and Windows display scaling. Add/edit is a modal dialog. Treeview row IDs map directly to model IDs, so punctuation in song titles cannot break selection.
 
-SongCollector retains CRUD, search, sorting, statistics, and persistence. Small validation changes reject malformed records and duplicate IDs before replacing the current library; invalid edits also leave the original song untouched. JSON keys and file structure are unchanged.
+SongCollector retains CRUD, search, sorting, statistics, and persistence. Validation rejects malformed records and duplicate IDs before replacing the current library; invalid edits leave the original song untouched. JSON keys and file structure are unchanged.
+
+`media_library.py` handles project paths and storage. `Path(__file__).resolve().parent` anchors the project, independent of the launch directory. `PureWindowsPath` extracts old filenames from either Windows slash style. Internal references use forward-slash relative paths; external links remain absolute. Manual imports first resolve relative references against this project, then fall back to the imported JSON's folder. Exports contain references, not copies of media; when moving to another computer, transfer the project media as well.
+
+Saves serialize into a uniquely named temporary file in the destination directory, flush and sync it, then use `os.replace`. A failed write/replacement leaves the previous JSON intact and reports the error; edits remain in memory. Closing with unsaved changes retries saving and asks before discarding them if it still fails. Atomic replacement depends on the filesystem; keep separate exports for backups. This phase does not add multi-instance locking, so use one running app per project.
+
+If startup finds corrupt or unreadable JSON, it reports an error and pauses automatic saving for that session. It does not fall back to the bundled library or overwrite the corrupt file with an empty collection. You can export new/recovered songs under a different JSON filename. To recover, close the app, **copy the unreadable file somewhere safe**, repair the working JSON or explicitly restore a known-good export, then restart. If only the legacy JSON exists and is corrupt, fix or back up that source before retrying first-start migration.
+
+Precise Git ignore rules cover `/data/library.json`, its atomic-save temporary files, and newly imported contents of `/media/audio` and `/media/covers`. Placeholder files keep those directories in the repository. Already-tracked root MP3/PNG files and the original JSON remain tracked. Exports saved elsewhere in the repository are not automatically ignored; prefer an external backup folder.
 
 ## Verification
 
 ```powershell
-.venv\Scripts\python.exe -m py_compile song_collector_gui.py
+.venv\Scripts\python.exe -m py_compile song_collector_gui.py media_library.py
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 .venv\Scripts\python.exe -m unittest discover -s tests -p gui_checks.py -v
 ```
 
-The first test suite checks the model, all sort modes, smart search, statistics, CRUD/IDs, unchanged JSON structure, successful round trips, failed-load safety, and the bundled library. The second opens Tk windows and requires a graphical Windows session; it checks add/edit/cancel, validation, filtering, selection, removal, theme/resize behavior, cover sizing, and mocked playback handoff. Tests write only to temporary folders; real music playback is not invoked.
+The default suite has **21 tests** for the existing model and Phase 2 storage, including migration of the eight-song fixture, Windows/relative paths, missing files, import/ID preservation, copying/collisions, corrupt JSON, and failed atomic replacement. The explicit GUI suite has **17 checks** covering the existing layout and the full autosave/import/recovery paths, real working-directory changes, media browsing choices, and relative cover/playback resolution. The GUI checks require a graphical Windows session. All test-library writes use temporary directories, and playback is mocked.
 
-Manual checks before everyday use:
+Verification also migrated the actual repository's eight-song library: all 16 relative audio/cover paths resolved. SHA-256 hashes confirmed that the original JSON and all 16 root media files were unchanged. `git check-ignore` confirmed that working data and imported media are ignored.
 
-1. Inspect both appearances at your Windows display scaling (100%, 125%, 150%, or higher), including focus outlines, dropdowns, long titles, and the add/edit dialog.
-2. Browse to real audio/cover files, test an unreadable/missing file, and listen using Play selected, Play all, and Random in your chosen default player.
-3. Save a test library under a new filename, load it back, and verify the close/load unsaved-change confirmations and overwrite behavior in native file dialogs.
-4. Check Tab navigation, Ctrl/Shift multi-selection, search with Enter, dialog Escape/Ctrl+Enter, and genre statistics.
+## Manual Phase 2 checks
+
+1. From the project folder, run `.venv\Scripts\python.exe song_collector_gui.py`. The eight songs should appear without importing anything. Select each song: its cover should display and audio should play in your default Windows player. `data/library.json` should contain root-relative media filenames, IDs 1–8, and `next_id` 9 on the initial migration.
+2. Add a song called `Phase 2 test` with artist `Test`, duration `10`, rating `3`, and no media. Check for the automatically-saved footer. Close and reopen: it should still exist. Edit its rating to `4`, reopen again, then remove it and reopen once more. Each operation should persist without exporting.
+3. Add a test song and Browse to an audio file **outside the repository**. Choose Yes. Repeat for an external PNG cover. Check that copies exist under `media/audio` and `media/covers`, that original files still exist, and that the JSON uses relative paths. Select the same external filename again to check that an existing copy is not overwritten. Choose No for a different selection to test external linking; Cancel should leave the field unchanged.
+4. Export to a new JSON file **outside the repository**, then import that export. Song IDs, ratings, genres, and durations should match. Try importing a separate malformed JSON file: an error should appear and the current songs should stay unchanged. A failed working save must leave an unsaved warning even after a recovery export.
+5. Edit only the test song's audio path to `media/audio/does-not-exist.mp3` and its cover path to `media/covers/does-not-exist.png`. The inspector should report missing/unavailable media and playback should give a useful message. The song must remain after reopening. Remove this test record when done.
+6. Verify launch-directory independence with the following commands from the project folder. Check covers and playback again:
+
+```powershell
+$project = (Get-Location).Path
+Push-Location $env:TEMP
+try {
+    & "$project\.venv\Scripts\python.exe" "$project\song_collector_gui.py"
+} finally {
+    Pop-Location
+}
+```
+
+For a manual **corrupt-startup check**, use an isolated disposable copy rather than damaging your working library. Run this from the project folder:
+
+```powershell
+$project = (Get-Location).Path
+$trial = Join-Path $env:TEMP ("SongCollector-trial-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $trial | Out-Null
+Copy-Item -LiteralPath .\song_collector_gui.py,.\media_library.py -Destination $trial
+New-Item -ItemType Directory -Path (Join-Path $trial 'data') | Out-Null
+Set-Content -LiteralPath (Join-Path $trial 'data/library.json') -Value '{broken' -Encoding UTF8
+& "$project\.venv\Scripts\python.exe" (Join-Path $trial 'song_collector_gui.py')
+Get-Content -LiteralPath (Join-Path $trial 'data/library.json')
+```
+
+Expect a startup error. Add a test record: an autosave error should appear while the record remains visible. Export a recovery JSON to another filename. Closing should warn about unsaved changes, and the final `Get-Content` should still show `{broken`. Your real project library is unaffected.
 
 ## Author
 

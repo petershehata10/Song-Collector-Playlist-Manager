@@ -10,6 +10,8 @@ import tkinter as tk
 from tkinter import messagebox, filedialog, font as tkfont
 import ttkbootstrap as ttk
 from PIL import Image, ImageTk
+from pathlib import Path, PureWindowsPath
+from media_library import PROJECT_ROOT, LIBRARY_ERRORS, WorkingLibrary, atomic_write_json
 
 
 # ========== DATA MODEL ==========
@@ -200,8 +202,7 @@ class SongCollector:
             "next_id": self._next_id,
             "songs": [s.to_dict() for s in self._songs],
         }
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        atomic_write_json(filename, data)
 
     def load_from_file(self, filename: str) -> None:
         with open(filename, "r", encoding="utf-8") as f:
@@ -234,8 +235,9 @@ class SongCollectorApp:
                     text="#232A32", muted="#536170", border="#D2D8DE", selected="#F2DDCC"),
     }
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, project_root: Path = PROJECT_ROOT) -> None:
         self.root = root
+        self.library = WorkingLibrary(project_root)
         root.title("Smart Song Collector & Playlist Manager")
         root.geometry("1280x780")
         root.minsize(1040, 680)
@@ -251,9 +253,10 @@ class SongCollectorApp:
         self.var_search = tk.StringVar(root)
         self.var_sort = tk.StringVar(root, value="Title")
         self.var_total = tk.StringVar(root)
-        self.var_status = tk.StringVar(root, value="Ready · Libraries are saved manually")
+        self.var_status = tk.StringVar(root, value="Opening local library…")
         self._configure_style()
         self._create_widgets()
+        self._load_working_library()
         self.refresh_list()
         root.bind("<Control-n>", lambda e: self.open_song_dialog())
         root.bind("<Control-f>", self._focus_search)
@@ -309,8 +312,8 @@ class SongCollectorApp:
         ttk.Separator(side).grid(row=3, column=0, sticky="ew", pady=20)
         files = ttk.Frame(side)
         files.grid(row=4, column=0, sticky="ew")
-        ttk.Button(files, style="Secondary.TButton", text="Load library…", command=self.load_library).pack(fill="x", pady=(0, 8))
-        ttk.Button(files, style="Secondary.TButton", text="Save library…", command=self.save_library).pack(fill="x")
+        ttk.Button(files, style="Secondary.TButton", text="Import library…", command=self.load_library).pack(fill="x", pady=(0, 8))
+        ttk.Button(files, style="Secondary.TButton", text="Export library…", command=self.save_library).pack(fill="x")
         self.theme_button = ttk.Button(side, style="Secondary.TButton", text="Light appearance", command=self.toggle_theme)
         self.theme_button.grid(row=6, column=0, sticky="ew")
         ttk.Label(side, text="Local music · Your files", style="Muted.TLabel").grid(row=7, column=0, pady=(12, 0))
@@ -477,13 +480,37 @@ class SongCollectorApp:
         self.current_edit_id = None
         self.on_song_selected()
 
+    def _load_working_library(self):
+        try:
+            self.collector = self.library.startup(SongCollector)
+            self.var_status.set("Automatic saving · data/library.json")
+        except LIBRARY_ERRORS as error:
+            if self.library.loaded_collector is not None:
+                self.collector = self.library.loaded_collector
+                self.dirty = True
+            self.var_status.set("Library startup failed · Changes are not saved")
+            messagebox.showerror("Library startup", f"Could not open or initialize the working library.\n{error}\n\nExisting files have been kept. Export any new edits before closing.", parent=self.root)
+
     def _mark_changed(self):
         self.dirty = True
-        self.var_status.set("Unsaved changes · Save library to keep your edits")
+        self._autosave()
+
+    def _autosave(self):
+        try:
+            self.library.save(self.collector)
+        except LIBRARY_ERRORS as error:
+            self.dirty = True
+            self.var_status.set("Automatic save failed · Unsaved changes in memory")
+            messagebox.showerror("Automatic save failed", f"Your changes are still in memory.\n{error}\n\nExport to a new JSON file before closing if saving keeps failing.", parent=self.dialog or self.root)
+            return False
+        self.dirty = False
+        self.var_status.set("Automatically saved · data/library.json")
+        return True
 
     def close(self):
-        if self.dirty and not messagebox.askyesno("Unsaved library", "Close without saving your library changes?", parent=self.root):
-            return
+        if self.dirty:
+            if not self._autosave() and not messagebox.askyesno("Unsaved library", "Automatic saving failed. Close and discard the changes still in memory? Export first if you need to keep them.", parent=self.root):
+                return
         self.root.destroy()
 
     # ---------- file browsing ----------
@@ -497,7 +524,7 @@ class SongCollectorApp:
             ],
         )
         if path:
-            self.var_filepath.set(path)
+            self._set_browsed_media(path, "audio", self.var_filepath)
 
     def browse_cover(self) -> None:
         path = filedialog.askopenfilename(
@@ -505,7 +532,30 @@ class SongCollectorApp:
             filetypes=[("PNG images", "*.png"), ("All files", "*.*")],
         )
         if path:
-            self.var_coverpath.set(path)
+            self._set_browsed_media(path, "covers", self.var_coverpath)
+
+    def _set_browsed_media(self, filename, kind, variable):
+        source = Path(filename).resolve()
+        try:
+            source.relative_to(self.library.media.root)
+            external = False
+        except ValueError:
+            external = True
+        copy = False
+        if external:
+            copy = messagebox.askyesnocancel(
+                "Keep media in this project?",
+                f"Copy {source.name} into media/{kind}?\n\nYes: copy into the project.\nNo: keep a link to the original file.\nCancel: leave this field unchanged.\nThe original file is never moved or deleted.",
+                parent=self.dialog or self.root,
+            )
+            if copy is None:
+                return
+        try:
+            reference = (self.library.media.copy_asset(source, kind) if copy
+                         else self.library.media.reference(source))
+            variable.set(reference)
+        except OSError as error:
+            messagebox.showerror("Media import", f"Could not copy this file. The form has not changed.\n{error}", parent=self.dialog or self.root)
 
     # ---------- core actions ----------
 
@@ -578,8 +628,8 @@ class SongCollectorApp:
             "duration_seconds": duration,
             "genre": genre,
             "rating": rating,
-            "filepath": filepath,
-            "cover_path": coverpath,
+            "filepath": self.library.media.normalize(filepath, "audio"),
+            "cover_path": self.library.media.normalize(coverpath, "covers"),
         }
 
     def refresh_list(self, songs: List[Song] | None = None) -> None:
@@ -645,7 +695,8 @@ class SongCollectorApp:
         self.detail_title.configure(text=song.title)
         minutes, seconds = divmod(song.duration_seconds, 60)
         self.detail_meta.configure(text=f"{song.artist}\n\n{song.genre or 'No genre'}\n{minutes}:{seconds:02d}  ·  Rating {song.rating} / 5")
-        self.detail_file.configure(text=(os.path.basename(song.filepath) + ("\nAudio file missing" if not os.path.isfile(song.filepath) else "")) if song.filepath else "No audio file linked")
+        audio = self.library.media.resolve(song.filepath, "audio")
+        self.detail_file.configure(text=(PureWindowsPath(song.filepath).name + ("\nAudio file missing" if audio is None or not audio.is_file() else "")) if song.filepath else "No audio file linked")
         if song.cover_path:
             self.show_cover_image(song.cover_path)
 
@@ -689,10 +740,11 @@ class SongCollectorApp:
             self.tree.selection_set(iid)
             self.tree.see(iid)
             self.on_song_selected()
-        if not os.path.isfile(song.filepath):
+        audio = self.library.media.resolve(song.filepath, "audio")
+        if audio is None or not audio.is_file():
             messagebox.showinfo("Play", "The linked audio file is missing.")
             return
-        self._open_audio(song.filepath)
+        self._open_audio(str(audio))
 
     def _play_song_ids(self, ids: List[int]) -> None:
         paths: List[str] = []
@@ -700,8 +752,9 @@ class SongCollectorApp:
             song = self.collector.get_song_by_id(song_id)
             if not song or not song.filepath:
                 continue
-            if os.path.exists(song.filepath):
-                paths.append(song.filepath)
+            audio = self.library.media.resolve(song.filepath, "audio")
+            if audio is not None and audio.is_file():
+                paths.append(str(audio))
 
         if not paths:
             messagebox.showinfo("Play", "No valid audio files to play.")
@@ -749,43 +802,49 @@ class SongCollectorApp:
 
     def save_library(self) -> None:
         filename = filedialog.asksaveasfilename(
-            title="Save library",
+            title="Export library", parent=self.root,
             defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            filetypes=[("JSON files", "*.json")],
         )
         if not filename:
             return
         try:
-            self.collector.save_to_file(filename)
-            self.dirty = False
-            self.var_status.set(f"Saved · {os.path.basename(filename)}")
-        except OSError as e:
-            messagebox.showerror("Save", f"Could not save library:\n{e}")
+            self.library.export(self.collector, filename)
+            # An export is a copy; it must not hide a failed working-library save.
+            if Path(filename).resolve() == self.library.path.resolve():
+                self.dirty = False
+            self.var_status.set(f"Exported · {Path(filename).name}" + (" · Working library still unsaved" if self.dirty else ""))
+        except LIBRARY_ERRORS as error:
+            messagebox.showerror("Export", f"Could not export library:\n{error}", parent=self.root)
 
     def load_library(self) -> None:
-        if self.dirty and not messagebox.askyesno("Unsaved library", "Replace the current library without saving its changes?"):
+        if self.dirty and not messagebox.askyesno("Unsaved library", "Replace the current library and discard its unsaved changes? Export first to keep them.", parent=self.root):
             return
         filename = filedialog.askopenfilename(
-            title="Load library",
+            title="Import library", parent=self.root,
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
         )
         if not filename:
             return
         try:
-            self.collector.load_from_file(filename)
-            self.var_search.set("")
-            self.tree.selection_remove(self.tree.selection())
-            self.refresh_list()
-            self.dirty = False
-            self.var_status.set(f"Loaded · {os.path.basename(filename)}")
-        except (OSError, ValueError, TypeError, KeyError, OverflowError) as e:
-            messagebox.showerror("Load", f"Could not load library:\n{e}")
+            candidate = self.library.read(filename, SongCollector)
+        except LIBRARY_ERRORS as error:
+            messagebox.showerror("Import", f"Could not import library. Your current songs have been kept.\n{error}", parent=self.root)
+            return
+        self.collector = candidate
+        self.var_search.set("")
+        self.tree.selection_remove(self.tree.selection())
+        self.refresh_list()
+        self._mark_changed()
 
     # ---------- cover & totals ----------
 
     def show_cover_image(self, path: str) -> None:
         try:
-            with Image.open(path) as source:
+            resolved = self.library.media.resolve(path, "covers")
+            if resolved is None:
+                raise FileNotFoundError(path)
+            with Image.open(resolved) as source:
                 source.thumbnail((210, 210))
                 self.cover_image = ImageTk.PhotoImage(source.copy(), master=self.root)
             self.lbl_cover.configure(image=self.cover_image, text="")

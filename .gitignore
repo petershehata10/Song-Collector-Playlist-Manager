@@ -4,3 +4,13 @@
 __pycache__/
 *.pyc
 .visual-checks/
+
+# Personal working library and temporary files from interrupted atomic saves.
+/data/library.json
+/data/.library.json.*.tmp
+
+# Newly imported assets only; tracked media in the repository root stays tracked.
+/media/audio/*
+!/media/audio/.gitkeep
+/media/covers/*
+!/media/covers/.gitkeep
