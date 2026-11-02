@@ -1,6 +1,7 @@
 """GUI integration checks. Run explicitly on a Windows graphical desktop."""
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 import tkinter as tk
 import unittest
 from unittest.mock import patch
@@ -48,6 +49,21 @@ class GuiTests(unittest.TestCase):
             self.root.update()
             self.assertGreater(self.app.tree.winfo_width(), 200)
             self.assertEqual(self.app.style.lookup('Library.Treeview', 'fieldbackground'), self.app.PALETTES[self.app.dark_mode]['surface'])
+
+    def test_application_name_and_light_palette(self):
+        self.assertEqual(self.root.title(), 'Song Collector & Playlist Manager')
+        self.app.dark_mode = False
+        self.app._configure_style()
+        self.assertEqual(self.app.PALETTES[False]['bg'], '#F5F2EC')
+        self.assertEqual(self.app.PALETTES[False]['selected'], '#EFD9C9')
+        self.assertEqual(self.app.style.lookup('Library.Treeview', 'fieldbackground'), '#FFFFFF')
+        self.assertEqual(self.app.style.lookup('Secondary.TButton', 'background'), '#E6E0D7')
+        self.assertEqual(self.app.style.lookup('Secondary.TButton', 'foreground'), '#25313B')
+        self.assertEqual(self.app.style.lookup('Secondary.TButton', 'bordercolor'), '#CFC6BC')
+        self.assertEqual(self.app.style.lookup('Secondary.TButton', 'background', ('active',)), '#EFD9C9')
+        self.assertEqual(self.app.style.lookup('Secondary.TButton', 'foreground', ('disabled',)), '#81786E')
+        self.app.dark_mode = True
+        self.app._configure_style()
 
     def test_dialog_add_edit_and_validation(self):
         self.app.open_song_dialog()
@@ -112,6 +128,42 @@ class GuiTests(unittest.TestCase):
             with patch('song_collector_gui.os.startfile', create=True) as player:
                 self.app.play_selected()
                 player.assert_called_once_with(str(path))
+
+    def test_play_all_writes_absolute_m3u_entries(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            paths = [root / 'first track.mp3', root / 'second, track.mp3', root / 'third [live].mp3']
+            for path in paths:
+                path.touch()
+            songs = [
+                self.app.collector.add_song(f'Song {index}', 'Artist', 10, '', 3, str(path), '')
+                for index, path in enumerate(paths)
+            ]
+            self.app.refresh_list()
+            playlist = []
+            with patch.object(self.app, '_open_audio', side_effect=lambda path: playlist.append(path)):
+                self.app.play_all()
+            self.assertEqual(len(playlist), 1)
+            playlist_path = Path(playlist[0])
+            try:
+                lines = playlist_path.read_text(encoding='utf-8-sig').splitlines()
+                self.assertEqual(lines[0], '#EXTM3U')
+                self.assertEqual(lines[1:], [str(path.resolve()) for path in paths])
+                self.assertTrue(all(Path(line).is_absolute() for line in lines[1:]))
+            finally:
+                playlist_path.unlink(missing_ok=True)
+            self.assertEqual([song.id for song in songs], [1, 2, 3])
+
+    def test_double_click_plays_row_instead_of_editing(self):
+        song = self.add_song()
+        row = str(song.id)
+        self.app.tree.selection_remove(self.app.tree.selection())
+        with patch.object(self.app, 'play_selected') as play, patch.object(self.app, 'open_song_dialog') as edit:
+            result = self.app._play_double_clicked_row(SimpleNamespace(y=self.app.tree.bbox(row)[1] + 1))
+        self.assertEqual(result, 'break')
+        self.assertEqual(self.app.tree.selection(), (row,))
+        play.assert_called_once_with()
+        edit.assert_not_called()
 
     def test_manual_save_load_and_unsaved_cancel(self):
         song = self.add_song()

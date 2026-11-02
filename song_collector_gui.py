@@ -233,14 +233,14 @@ class SongCollectorApp:
     PALETTES = {
         True: dict(bg="#171D24", surface="#252E38", accent="#E8A06C",
                    text="#F0F2F4", muted="#B7C1CC", border="#3D4B59", selected="#65432D"),
-        False: dict(bg="#F6F5F2", surface="#FFFFFF", accent="#B86B3F",
-                    text="#232A32", muted="#536170", border="#D2D8DE", selected="#F2DDCC"),
+        False: dict(bg="#F5F2EC", surface="#FFFFFF", accent="#B9683B",
+                    text="#25313B", muted="#536170", border="#CFC6BC", selected="#EFD9C9"),
     }
 
     def __init__(self, root: tk.Tk, project_root: Path = PROJECT_ROOT) -> None:
         self.root = root
         self.library = WorkingLibrary(project_root)
-        root.title("Smart Song Collector & Playlist Manager")
+        root.title("Song Collector & Playlist Manager")
         root.geometry("1280x780")
         root.minsize(1040, 680)
         self.dark_mode = True
@@ -288,9 +288,34 @@ class SongCollectorApp:
         self.style.configure("Heading.TLabel", font=("Segoe UI Semibold", 12))
         self.style.configure("Secondary.TButton", font=("Segoe UI", 10), padding=(12, 8),
                              background=c["surface"], foreground=c["text"], bordercolor=c["border"], focuscolor=c["accent"])
-        self.style.map("Secondary.TButton", background=[("active", c["selected"])],
-                       foreground=[("disabled", c["muted"]), ("active", c["text"])],
-                       bordercolor=[("focus", c["accent"]), ("active", c["accent"])])
+        if self.dark_mode:
+            self.style.map("Secondary.TButton", background=[("active", c["selected"])],
+                           foreground=[("disabled", c["muted"]), ("active", c["text"])],
+                           bordercolor=[("focus", c["accent"]), ("active", c["accent"])])
+        else:
+            self.style.configure(
+                "Secondary.TButton",
+                background="#E6E0D7",
+                foreground="#25313B",
+                bordercolor="#CFC6BC",
+                lightcolor="#CFC6BC",
+                darkcolor="#CFC6BC",
+            )
+            self.style.map(
+                "Secondary.TButton",
+                background=[
+                    ("disabled", "#EEEAE4"),
+                    ("pressed", "#D8CBBE"),
+                    ("active", "#EFD9C9"),
+                ],
+                foreground=[("disabled", "#81786E"), ("pressed", "#25313B"), ("active", "#25313B")],
+                bordercolor=[
+                    ("disabled", "#DDD5CC"),
+                    ("focus", "#B9683B"),
+                    ("pressed", "#B9683B"),
+                    ("active", "#CFC6BC"),
+                ],
+            )
         self.style.configure("Accent.TButton", background=c["accent"], foreground="#171D24" if self.dark_mode else "#FFFFFF", bordercolor=c["accent"])
         self.style.map("Accent.TButton", background=[("active", "#F0B88F" if self.dark_mode else "#98512B")])
         for name in ("TEntry", "TCombobox", "TSpinbox"):
@@ -308,13 +333,22 @@ class SongCollectorApp:
         if self.dialog is not None:
             self.dialog.configure(background=self.PALETTES[self.dark_mode]["bg"])
 
+    def _play_double_clicked_row(self, event: tk.Event) -> str:
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return "break"
+        self.tree.selection_set(row)
+        self.tree.focus(row)
+        self.play_selected()
+        return "break"
+
     def _create_widgets(self) -> None:
         self.root.rowconfigure(0, weight=1)
         self.root.columnconfigure(1, weight=1)
         side = ttk.Frame(self.root, padding=(16, 24))
         side.grid(row=0, column=0, sticky="ns")
         side.rowconfigure(5, weight=1)
-        ttk.Label(side, text="SMART SONG\nCOLLECTOR", style="Heading.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 28))
+        ttk.Label(side, text="SONG COLLECTOR\n& PLAYLIST MANAGER", style="Heading.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 28))
         ttk.Button(side, text="Music library", command=self.show_all, style="Accent.TButton").grid(row=1, column=0, sticky="ew")
         ttk.Button(side, style="Secondary.TButton", text="Genre statistics", command=self.show_stats).grid(row=2, column=0, sticky="ew", pady=(8, 0))
         ttk.Separator(side).grid(row=3, column=0, sticky="ew", pady=20)
@@ -371,7 +405,7 @@ class SongCollectorApp:
         horizontal.grid(row=1, column=0, sticky="ew")
         self.tree.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
         self.tree.bind("<<TreeviewSelect>>", self.on_song_selected)
-        self.tree.bind("<Double-1>", lambda e: self.open_song_dialog(edit=True) if self.tree.identify_row(e.y) else None)
+        self.tree.bind("<Double-1>", self._play_double_clicked_row)
         self.tree.bind("<Delete>", lambda e: self.delete_selected())
         self.empty = ttk.Frame(table, padding=20)
         self.empty_title = ttk.Label(self.empty, style="Heading.TLabel", text="Your library starts here")
@@ -831,13 +865,17 @@ class SongCollectorApp:
 
     def _play_song_ids(self, ids: List[int]) -> None:
         paths: List[str] = []
+        missing = 0
         for song_id in ids:
             song = self.collector.get_song_by_id(song_id)
             if not song or not song.filepath:
+                missing += 1
                 continue
             audio = self.library.media.resolve(song.filepath, "audio")
             if audio is not None and audio.is_file():
-                paths.append(str(audio))
+                paths.append(str(audio.resolve()))
+            else:
+                missing += 1
 
         if not paths:
             messagebox.showinfo("Play", "No valid audio files to play.")
@@ -849,12 +887,18 @@ class SongCollectorApp:
 
         try:
             with tempfile.NamedTemporaryFile(
-                delete=False, suffix=".m3u", mode="w", encoding="utf-8"
+                delete=False, suffix=".m3u", mode="w", encoding="utf-8-sig",
+                newline="\n",
             ) as f:
+                f.write("#EXTM3U\n")
                 for p in paths:
                     f.write(p + "\n")
                 playlist_path = f.name
             self._open_audio(playlist_path)
+            if missing:
+                self.var_status.set(
+                    f"Playing {len(paths)} song(s) · {missing} missing or unlinked"
+                )
         except OSError as e:
             messagebox.showerror("Play", f"Could not create playlist:\n{e}")
 
