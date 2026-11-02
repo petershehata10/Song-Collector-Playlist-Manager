@@ -7,7 +7,9 @@ import json
 import random
 import tempfile
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import messagebox, filedialog, font as tkfont
+import ttkbootstrap as ttk
+from PIL import Image, ImageTk
 
 
 # ========== DATA MODEL ==========
@@ -25,6 +27,14 @@ class Song:
     id: int = field(default_factory=int)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.title, str) or not self.title.strip() or not isinstance(self.artist, str) or not self.artist.strip():
+            raise ValueError("Title and artist are required text fields.")
+        if any(not isinstance(value, str) for value in (self.genre, self.filepath, self.cover_path)):
+            raise ValueError("Genre and file paths must be text.")
+        if type(self.duration_seconds) is not int or type(self.rating) is not int:
+            raise ValueError("Duration and rating must be integers.")
+        if type(self.id) is not int or self.id < 0:
+            raise ValueError("Song ID must be a non-negative integer.")
         if self.duration_seconds < 0:
             raise ValueError("Duration must be non-negative.")
         if not (1 <= self.rating <= 5):
@@ -144,13 +154,10 @@ class SongCollector:
         song = self.get_song_by_id(song_id)
         if song is None:
             return False
-        song.title = title
-        song.artist = artist
-        song.duration_seconds = duration_seconds
-        song.genre = genre
-        song.rating = rating
-        song.filepath = filepath
-        song.cover_path = cover_path
+        # Validate the full edit before changing the existing song.
+        updated = Song(title, artist, duration_seconds, genre, rating, filepath, cover_path, song_id)
+        for name, value in updated.to_dict().items():
+            setattr(song, name, value)
         return True
 
     # ----- sorting -----
@@ -199,255 +206,291 @@ class SongCollector:
     def load_from_file(self, filename: str) -> None:
         with open(filename, "r", encoding="utf-8") as f:
             data = json.load(f)
-        self._songs = [Song.from_dict(d) for d in data.get("songs", [])]
-        max_id = max((s.id for s in self._songs), default=0)
-        self._next_id = max(max_id + 1, int(data.get("next_id", max_id + 1)))
+        if not isinstance(data, dict) or not isinstance(data.get("songs"), list):
+            raise ValueError("Library must contain a songs list.")
+        songs = []
+        for record in data["songs"]:
+            if not isinstance(record, dict):
+                raise ValueError("Each song must be an object.")
+            songs.append(Song.from_dict(record))
+        ids = [song.id for song in songs]
+        if len(set(ids)) != len(ids):
+            raise ValueError("Library contains duplicate song IDs.")
+        max_id = max(ids, default=0)
+        next_id = max(max_id + 1, int(data.get("next_id", max_id + 1)))
+        # Commit only after the entire library has passed validation.
+        self._songs = songs
+        self._next_id = next_id
+
 
 
 # ========== GUI APPLICATION ==========
 
 class SongCollectorApp:
+    PALETTES = {
+        True: dict(bg="#171D24", surface="#252E38", accent="#E8A06C",
+                   text="#F0F2F4", muted="#B7C1CC", border="#3D4B59", selected="#65432D"),
+        False: dict(bg="#F6F5F2", surface="#FFFFFF", accent="#B86B3F",
+                    text="#232A32", muted="#536170", border="#D2D8DE", selected="#F2DDCC"),
+    }
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Song Collector & Playlist Manager")
-        self.root.geometry("1300x700")
-        self.root.minsize(1200, 650)
-
-        self.dark_mode = False
-        self.cover_image: tk.PhotoImage | None = None
-        self.current_edit_id: int | None = None
-
-        self._configure_style()
+        root.title("Smart Song Collector & Playlist Manager")
+        root.geometry("1280x780")
+        root.minsize(1040, 680)
+        self.dark_mode = True
         self.collector = SongCollector()
+        self.cover_image = None
+        self.current_edit_id = None
+        self.dialog = None
+        self.dirty = False
+        self.style = ttk.Style("darkly")
+        for name in ("title", "artist", "duration", "genre", "rating", "filepath", "coverpath"):
+            setattr(self, "var_" + name, tk.StringVar(root))
+        self.var_search = tk.StringVar(root)
+        self.var_sort = tk.StringVar(root, value="Title")
+        self.var_total = tk.StringVar(root)
+        self.var_status = tk.StringVar(root, value="Ready · Libraries are saved manually")
+        self._configure_style()
         self._create_widgets()
-        self._apply_theme_to_runtime_widgets()
+        self.refresh_list()
+        root.bind("<Control-n>", lambda e: self.open_song_dialog())
+        root.bind("<Control-f>", self._focus_search)
+        root.bind("<Control-s>", lambda e: self.save_library())
+        root.bind("<Control-o>", lambda e: self.load_library())
+        root.protocol("WM_DELETE_WINDOW", self.close)
 
-    # ------- visual style --------
     def _configure_style(self) -> None:
-        self._bg_light = "#f3f3f3"
-        self._fg_light = "#000000"
-        self._entry_bg_light = "#ffffff"
-
-        self._bg_dark = "#1e1e1e"
-        self._fg_dark = "#ffffff"
-        self._entry_bg_dark = "#2b2b2b"
-
-        self._accent = "#0078D7"
-
-        bg = self._bg_dark if self.dark_mode else self._bg_light
-        fg = self._fg_dark if self.dark_mode else self._fg_light
-        entry_bg = self._entry_bg_dark if self.dark_mode else self._entry_bg_light
-
-        self.root.configure(bg=bg)
-        style = ttk.Style(self.root)
-
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-
-        style.configure("TFrame", background=bg)
-        style.configure("TLabelframe", background=bg)
-        style.configure(
-            "TLabelframe.Label",
-            background=bg,
-            foreground=fg,
-            font=("Segoe UI", 11, "bold"),
-        )
-        style.configure(
-            "TLabel",
-            background=bg,
-            foreground=fg,
-            font=("Segoe UI", 10),
-        )
-        style.configure(
-            "TButton",
-            font=("Segoe UI", 10),
-            padding=6,
-        )
-        style.configure(
-            "TEntry",
-            font=("Segoe UI", 10),
-            fieldbackground=entry_bg,
-            foreground=fg,
-        )
-        style.configure(
-            "TCombobox",
-            font=("Segoe UI", 10),
-            fieldbackground=entry_bg,
-            foreground=fg,
-        )
-        style.map(
-            "TButton",
-            background=[("active", self._accent)],
-            foreground=[("active", "#ffffff")],
-        )
+        c = self.PALETTES[self.dark_mode]
+        self.style.theme_use("darkly" if self.dark_mode else "flatly")
+        self.root.configure(background=c["bg"])
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+            tkfont.nametofont(name).configure(family="Segoe UI", size=10)
+        self.root.option_add("*TCombobox*Listbox.background", c["surface"])
+        self.root.option_add("*TCombobox*Listbox.foreground", c["text"])
+        for name, bg in (("TFrame", c["bg"]), ("Surface.TFrame", c["surface"])):
+            self.style.configure(name, background=bg)
+        self.style.configure("TLabel", background=c["bg"], foreground=c["text"], font=("Segoe UI", 10))
+        self.style.configure("Muted.TLabel", foreground=c["muted"])
+        self.style.configure("Title.TLabel", font=("Segoe UI Semibold", 23))
+        self.style.configure("Heading.TLabel", font=("Segoe UI Semibold", 12))
+        self.style.configure("Secondary.TButton", font=("Segoe UI", 10), padding=(12, 8),
+                             background=c["surface"], foreground=c["text"], bordercolor=c["border"], focuscolor=c["accent"])
+        self.style.map("Secondary.TButton", background=[("active", c["selected"])],
+                       foreground=[("disabled", c["muted"]), ("active", c["text"])],
+                       bordercolor=[("focus", c["accent"]), ("active", c["accent"])])
+        self.style.configure("Accent.TButton", background=c["accent"], foreground="#171D24" if self.dark_mode else "#FFFFFF", bordercolor=c["accent"])
+        self.style.map("Accent.TButton", background=[("active", "#F0B88F" if self.dark_mode else "#98512B")])
+        for name in ("TEntry", "TCombobox", "TSpinbox"):
+            self.style.configure(name, fieldbackground=c["surface"], foreground=c["text"], bordercolor=c["border"], lightcolor=c["surface"], darkcolor=c["surface"], padding=7)
+            self.style.map(name, bordercolor=[("focus", c["accent"])])
+        self.style.configure("Library.Treeview", background=c["surface"], fieldbackground=c["surface"], foreground=c["text"], rowheight=38, font=("Segoe UI", 10), borderwidth=0)
+        self.style.configure("Library.Treeview.Heading", background=c["bg"], foreground=c["muted"], font=("Segoe UI Semibold", 10), padding=(10, 10))
+        self.style.map("Library.Treeview", background=[("selected", c["selected"])], foreground=[("selected", c["text"])])
 
     def toggle_theme(self) -> None:
         self.dark_mode = not self.dark_mode
         self._configure_style()
-        self._apply_theme_to_runtime_widgets()
-
-    def _apply_theme_to_runtime_widgets(self) -> None:
-        bg = self._bg_dark if self.dark_mode else self._bg_light
-        fg = self._fg_dark if self.dark_mode else self._fg_light
-        entry_bg = self._entry_bg_dark if self.dark_mode else self._entry_bg_light
-
-        self.root.configure(bg=bg)
-        if hasattr(self, "lst_songs"):
-            self.lst_songs.configure(
-                bg=entry_bg,
-                fg=fg,
-                selectbackground=self._accent,
-                selectforeground="#ffffff",
-            )
-        if hasattr(self, "lbl_cover"):
-            self.lbl_cover.configure(background=bg)
+        self.inspector_canvas.configure(background=self.PALETTES[self.dark_mode]["bg"])
+        self.theme_button.configure(text="Light appearance" if self.dark_mode else "Dark appearance")
+        if self.dialog is not None:
+            self.dialog.configure(background=self.PALETTES[self.dark_mode]["bg"])
 
     def _create_widgets(self) -> None:
-        # --- input frame ---
-        frm_input = ttk.LabelFrame(self.root, text="Add / Edit Song")
-        frm_input.grid(row=0, column=0, padx=12, pady=10, sticky="new")
-
-        ttk.Label(frm_input, text="Title:").grid(row=0, column=0, sticky="w")
-        ttk.Label(frm_input, text="Artist:").grid(row=1, column=0, sticky="w")
-        ttk.Label(frm_input, text="Duration (sec):").grid(row=2, column=0, sticky="w")
-        ttk.Label(frm_input, text="Genre:").grid(row=3, column=0, sticky="w")
-        ttk.Label(frm_input, text="Rating (1–5):").grid(row=4, column=0, sticky="w")
-        ttk.Label(frm_input, text="Audio file:").grid(row=5, column=0, sticky="w")
-        ttk.Label(frm_input, text="Cover image:").grid(row=6, column=0, sticky="w")
-
-        self.var_title = tk.StringVar()
-        self.var_artist = tk.StringVar()
-        self.var_duration = tk.StringVar()
-        self.var_genre = tk.StringVar()
-        self.var_rating = tk.StringVar()
-        self.var_filepath = tk.StringVar()
-        self.var_coverpath = tk.StringVar()
-
-        entry_width = 32
-
-        ttk.Entry(frm_input, textvariable=self.var_title,
-                  width=entry_width).grid(row=0, column=1, padx=5, pady=3, sticky="ew")
-        ttk.Entry(frm_input, textvariable=self.var_artist,
-                  width=entry_width).grid(row=1, column=1, padx=5, pady=3, sticky="ew")
-        ttk.Entry(frm_input, textvariable=self.var_duration,
-                  width=entry_width).grid(row=2, column=1, padx=5, pady=3, sticky="ew")
-        ttk.Entry(frm_input, textvariable=self.var_genre,
-                  width=entry_width).grid(row=3, column=1, padx=5, pady=3, sticky="ew")
-        ttk.Entry(frm_input, textvariable=self.var_rating,
-                  width=entry_width).grid(row=4, column=1, padx=5, pady=3, sticky="ew")
-
-        file_frame = ttk.Frame(frm_input)
-        file_frame.grid(row=5, column=1, padx=5, pady=3, sticky="ew")
-        ttk.Entry(file_frame, textvariable=self.var_filepath,
-                  width=entry_width - 8).grid(row=0, column=0, sticky="ew")
-        ttk.Button(file_frame, text="Browse…",
-                   command=self.browse_audio).grid(row=0, column=1, padx=4)
-
-        cover_frame = ttk.Frame(frm_input)
-        cover_frame.grid(row=6, column=1, padx=5, pady=3, sticky="ew")
-        ttk.Entry(cover_frame, textvariable=self.var_coverpath,
-                  width=entry_width - 8).grid(row=0, column=0, sticky="ew")
-        ttk.Button(cover_frame, text="Browse PNG…",
-                   command=self.browse_cover).grid(row=0, column=1, padx=4)
-
-        btn_frame = ttk.Frame(frm_input)
-        btn_frame.grid(row=7, column=0, columnspan=2, pady=10, sticky="ew")
-        ttk.Button(btn_frame, text="Add song",
-                   command=self.add_song).grid(row=0, column=0, sticky="ew", padx=2)
-        ttk.Button(btn_frame, text="Update selected",
-                   command=self.update_selected_song).grid(row=0, column=1, sticky="ew", padx=2)
-        ttk.Button(btn_frame, text="Clear form",
-                   command=self.clear_form).grid(row=0, column=2, sticky="ew", padx=2)
-        btn_frame.columnconfigure(0, weight=1)
-        btn_frame.columnconfigure(1, weight=1)
-        btn_frame.columnconfigure(2, weight=1)
-
-        # --- search / sort / stats frame ---
-        frm_actions = ttk.LabelFrame(self.root, text="Search / Sort / Stats")
-        frm_actions.grid(row=1, column=0, padx=12, pady=(0, 10), sticky="new")
-
-        ttk.Label(frm_actions, text="Search keyword:").grid(row=0, column=0, sticky="w")
-        self.var_search = tk.StringVar()
-        ttk.Entry(frm_actions, textvariable=self.var_search, width=20).grid(
-            row=0, column=1, padx=5, pady=3, sticky="w"
-        )
-        ttk.Button(frm_actions, text="Smart search",
-                   command=self.smart_search).grid(row=0, column=2, padx=5)
-
-        ttk.Label(frm_actions, text="Sort by:").grid(row=1, column=0, sticky="w")
-        self.var_sort = tk.StringVar(value="Title")
-        cmb_sort = ttk.Combobox(
-            frm_actions,
-            textvariable=self.var_sort,
-            values=["Title", "Duration", "Rating", "Newest", "Oldest"],
-            width=18,
-            state="readonly",
-        )
-        cmb_sort.grid(row=1, column=1, padx=5, pady=3, sticky="w")
-        ttk.Button(frm_actions, text="Apply sort",
-                   command=self.apply_sort).grid(row=1, column=2, padx=5)
-
-        ttk.Button(frm_actions, text="Show genre stats",
-                   command=self.show_stats).grid(row=2, column=0, columnspan=3, pady=4, sticky="ew")
-
-        ttk.Button(frm_actions, text="Toggle dark / light",
-                   command=self.toggle_theme).grid(row=3, column=0, pady=6, sticky="ew")
-        ttk.Button(frm_actions, text="Save library",
-                   command=self.save_library).grid(row=3, column=1, pady=6, sticky="ew")
-        ttk.Button(frm_actions, text="Load library",
-                   command=self.load_library).grid(row=3, column=2, pady=6, sticky="ew")
-
-        # --- list frame ---
-        frm_list = ttk.LabelFrame(self.root, text="Songs")
-        frm_list.grid(row=0, column=1, rowspan=2,
-                      padx=(5, 12), pady=10, sticky="nsew")
-
-        self.lst_songs = tk.Listbox(
-            frm_list,
-            width=70,
-            height=20,
-            font=("Segoe UI", 10),
-            selectmode=tk.EXTENDED,
-        )
-        self.lst_songs.grid(row=0, column=0, columnspan=4,
-                            padx=5, pady=5, sticky="nsew")
-
-        scrollbar = ttk.Scrollbar(
-            frm_list, orient="vertical", command=self.lst_songs.yview
-        )
-        scrollbar.grid(row=0, column=4, sticky="ns")
-        self.lst_songs.configure(yscrollcommand=scrollbar.set)
-
-        self.lbl_cover = ttk.Label(frm_list, text="Album cover preview\n(PNG)")
-        self.lbl_cover.grid(row=0, column=5, padx=10, pady=5, sticky="n")
-        self.lst_songs.bind("<<ListboxSelect>>", self.on_song_selected)
-
-        ttk.Button(frm_list, text="Play selected",
-                   command=self.play_selected).grid(row=1, column=0, pady=6, padx=3, sticky="ew")
-        ttk.Button(frm_list, text="Play ALL",
-                   command=self.play_all).grid(row=1, column=1, pady=6, padx=3, sticky="ew")
-        ttk.Button(frm_list, text="Play random",
-                   command=self.play_random).grid(row=1, column=2, pady=6, padx=3, sticky="ew")
-        ttk.Button(frm_list, text="Delete selected",
-                   command=self.delete_selected).grid(row=1, column=3, pady=6, padx=3, sticky="ew")
-        ttk.Button(frm_list, text="Show all",
-                   command=self.refresh_list).grid(row=1, column=5, pady=6, padx=3, sticky="ew")
-
-        self.var_total = tk.StringVar(value="Total: 0 songs, 0:00:00")
-        lbl_total = ttk.Label(frm_list, textvariable=self.var_total)
-        lbl_total.grid(row=2, column=0, columnspan=6,
-                       pady=(4, 0), sticky="w")
-
+        self.root.rowconfigure(0, weight=1)
         self.root.columnconfigure(1, weight=1)
-        frm_list.rowconfigure(0, weight=1)
+        side = ttk.Frame(self.root, padding=(16, 24))
+        side.grid(row=0, column=0, sticky="ns")
+        side.rowconfigure(5, weight=1)
+        ttk.Label(side, text="SMART SONG\nCOLLECTOR", style="Heading.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 28))
+        ttk.Button(side, text="Music library", command=self.show_all, style="Accent.TButton").grid(row=1, column=0, sticky="ew")
+        ttk.Button(side, style="Secondary.TButton", text="Genre statistics", command=self.show_stats).grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        ttk.Separator(side).grid(row=3, column=0, sticky="ew", pady=20)
+        files = ttk.Frame(side)
+        files.grid(row=4, column=0, sticky="ew")
+        ttk.Button(files, style="Secondary.TButton", text="Load library…", command=self.load_library).pack(fill="x", pady=(0, 8))
+        ttk.Button(files, style="Secondary.TButton", text="Save library…", command=self.save_library).pack(fill="x")
+        self.theme_button = ttk.Button(side, style="Secondary.TButton", text="Light appearance", command=self.toggle_theme)
+        self.theme_button.grid(row=6, column=0, sticky="ew")
+        ttk.Label(side, text="Local music · Your files", style="Muted.TLabel").grid(row=7, column=0, pady=(12, 0))
+        ttk.Separator(self.root, orient="vertical").grid(row=0, column=0, sticky="nse")
+
+        main = ttk.Frame(self.root, padding=(24, 24, 20, 12))
+        main.grid(row=0, column=1, sticky="nsew")
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(3, weight=1)
+        header = ttk.Frame(main)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 20))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="Music library", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        self.count_label = ttk.Label(header, style="Muted.TLabel")
+        self.count_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(header, text="Add song", command=self.open_song_dialog, style="Accent.TButton").grid(row=0, column=1, rowspan=2)
+        search = ttk.Frame(main)
+        search.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        search.columnconfigure(1, weight=1)
+        ttk.Label(search, text="Search").grid(row=0, column=0, padx=(0, 10))
+        self.search_entry = ttk.Entry(search, textvariable=self.var_search)
+        self.search_entry.grid(row=0, column=1, sticky="ew")
+        self.search_entry.bind("<Return>", lambda e: self.smart_search())
+        ttk.Button(search, style="Secondary.TButton", text="Search", command=self.smart_search).grid(row=0, column=2, padx=8)
+        ttk.Button(search, style="Secondary.TButton", text="Clear", command=self.show_all).grid(row=0, column=3)
+        toolbar = ttk.Frame(main)
+        toolbar.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        toolbar.columnconfigure(0, weight=1)
+        ttk.Label(toolbar, text="Title / artist keywords", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(toolbar, text="Sort by").grid(row=0, column=1, padx=(8, 8))
+        combo = ttk.Combobox(toolbar, textvariable=self.var_sort, values=["Title", "Duration", "Rating", "Newest", "Oldest"], state="readonly", width=10)
+        combo.grid(row=0, column=2)
+        combo.bind("<<ComboboxSelected>>", lambda e: self.apply_sort())
+        table = ttk.Frame(main)
+        table.grid(row=3, column=0, sticky="nsew")
+        table.rowconfigure(0, weight=1)
+        table.columnconfigure(0, weight=1)
+        columns = ("title", "artist", "genre", "duration", "rating")
+        self.tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="extended", style="Library.Treeview")
+        for col, width, minimum in zip(columns, (200, 145, 130, 90, 85), (160, 130, 120, 90, 85)):
+            self.tree.heading(col, text=col.title())
+            self.tree.column(col, width=width, minwidth=minimum, stretch=col in ("title", "artist", "genre"), anchor="w" if col in ("title", "artist", "genre") else "center")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(table, command=self.tree.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(table, orient="horizontal", command=self.tree.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.tree.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
+        self.tree.bind("<<TreeviewSelect>>", self.on_song_selected)
+        self.tree.bind("<Double-1>", lambda e: self.open_song_dialog(edit=True) if self.tree.identify_row(e.y) else None)
+        self.tree.bind("<Delete>", lambda e: self.delete_selected())
+        self.empty = ttk.Frame(table, padding=20)
+        self.empty_title = ttk.Label(self.empty, style="Heading.TLabel", text="Your library starts here")
+        self.empty_title.pack(pady=(0, 8))
+        self.empty_hint = ttk.Label(self.empty, text="Add a song or load an existing JSON library.")
+        self.empty_hint.pack(pady=(0, 16))
+        self.empty_button = ttk.Button(self.empty, text="Add your first song", command=self.open_song_dialog, style="Accent.TButton")
+        self.empty_button.pack()
+        footer = ttk.Frame(main)
+        footer.grid(row=4, column=0, sticky="ew", pady=(12, 8))
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(footer, textvariable=self.var_total, style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        self.play_all_button = ttk.Button(footer, style="Secondary.TButton", text="Play all", command=self.play_all)
+        self.play_all_button.grid(row=0, column=1, padx=(8, 6))
+        self.random_button = ttk.Button(footer, style="Secondary.TButton", text="Random", command=self.play_random)
+        self.random_button.grid(row=0, column=2)
+        ttk.Label(main, textvariable=self.var_status, style="Muted.TLabel").grid(row=5, column=0, sticky="w")
+
+        inspector = ttk.Frame(self.root, width=280)
+        inspector.grid(row=0, column=2, sticky="ns")
+        inspector.grid_propagate(False)
+        inspector.rowconfigure(0, weight=1)
+        inspector.columnconfigure(0, weight=1)
+        self.inspector_canvas = tk.Canvas(inspector, highlightthickness=0,
+                                         background=self.PALETTES[self.dark_mode]["bg"])
+        self.inspector_canvas.grid(row=0, column=0, sticky="nsew")
+        inspector_scroll = ttk.Scrollbar(inspector, command=self.inspector_canvas.yview)
+        inspector_scroll.grid(row=0, column=1, sticky="ns")
+        self.inspector_canvas.configure(yscrollcommand=inspector_scroll.set)
+        details = ttk.Frame(self.inspector_canvas, padding=(16, 28))
+        details_window = self.inspector_canvas.create_window((0, 0), window=details, anchor="nw")
+        details.bind("<Configure>", lambda e: self.inspector_canvas.configure(scrollregion=self.inspector_canvas.bbox("all")))
+        self.inspector_canvas.bind("<Configure>", lambda e: self.inspector_canvas.itemconfigure(details_window, width=e.width))
+        details.columnconfigure(0, weight=1)
+        ttk.Label(details, text="SONG DETAILS", style="Muted.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 20))
+        self.lbl_cover = ttk.Label(details, text="No cover selected", anchor="center", width=26)
+        self.lbl_cover.grid(row=1, column=0, sticky="ew", pady=(0, 20))
+        self.detail_title = ttk.Label(details, text="Select a song", style="Heading.TLabel", wraplength=215)
+        self.detail_title.grid(row=2, column=0, sticky="w", pady=(0, 8))
+        self.detail_meta = ttk.Label(details, text="Browse your library to see details.", wraplength=215, style="Muted.TLabel")
+        self.detail_meta.grid(row=3, column=0, sticky="w", pady=(0, 12))
+        self.detail_file = ttk.Label(details, wraplength=215, style="Muted.TLabel")
+        self.detail_file.grid(row=4, column=0, sticky="w", pady=(0, 20))
+        self.selection_buttons = []
+        for row, text, command in ((5, "Play selected", self.play_selected), (6, "Edit song", lambda: self.open_song_dialog(edit=True)), (7, "Remove from library", self.delete_selected)):
+            button = ttk.Button(details, style="Secondary.TButton", text=text, command=command)
+            button.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+            self.selection_buttons.append(button)
+        ttk.Label(details, text="Audio opens in your default player.\nRemoving a song keeps its files.", wraplength=215, style="Muted.TLabel").grid(row=8, column=0, sticky="w", pady=(12, 0))
+
+        for widget in (details, *details.winfo_children()):
+            widget.bind("<MouseWheel>", lambda e: self.inspector_canvas.yview_scroll(-int(e.delta / 120), "units"))
+
+    def _focus_search(self, event=None):
+        if self.dialog is None:
+            self.search_entry.focus_set()
+        return "break"
+
+    def show_all(self):
+        self.var_search.set("")
+        self.refresh_list()
+
+    def open_song_dialog(self, edit=False):
+        if self.dialog is not None:
+            self.dialog.lift()
+            return
+        ids = self._get_selected_ids()
+        if edit and len(ids) != 1:
+            return
+        self.clear_form()
+        if edit:
+            self.current_edit_id = ids[0]
+            self._load_song_into_form(self.collector.get_song_by_id(ids[0]))
+        else:
+            self.var_rating.set("3")
+            self.var_duration.set("0")
+        dialog = tk.Toplevel(self.root)
+        self.dialog = dialog
+        dialog.title("Edit song" if edit else "Add song")
+        dialog.configure(background=self.PALETTES[self.dark_mode]["bg"])
+        dialog.transient(self.root)
+        dialog.resizable(True, False)
+        body = ttk.Frame(dialog, padding=24)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        ttk.Label(body, text="Edit song" if edit else "Add to your library", style="Heading.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 18))
+        first = None
+        for row, (label, name) in enumerate((("Title *", "title"), ("Artist *", "artist"), ("Duration (seconds)", "duration"), ("Genre", "genre"), ("Rating (1–5)", "rating"), ("Audio file", "filepath"), ("Cover image", "coverpath")), 1):
+            ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", padx=(0, 16), pady=8)
+            entry = ttk.Entry(body, textvariable=getattr(self, "var_" + name), width=42)
+            entry.grid(row=row, column=1, sticky="ew", pady=8)
+            if first is None:
+                first = entry
+            if name in ("filepath", "coverpath"):
+                ttk.Button(body, style="Secondary.TButton", text="Browse…", command=self.browse_audio if name == "filepath" else self.browse_cover).grid(row=row, column=2, padx=(8, 0))
+        ttk.Label(body, text="Audio and cover files are optional. Duration is entered manually.", style="Muted.TLabel").grid(row=8, column=0, columnspan=3, sticky="w", pady=(10, 16))
+        buttons = ttk.Frame(body)
+        buttons.grid(row=9, column=0, columnspan=3, sticky="e")
+        ttk.Button(buttons, style="Secondary.TButton", text="Cancel", command=self._close_dialog).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="Save changes" if edit else "Add song", style="Accent.TButton", command=self.update_selected_song if edit else self.add_song).pack(side="left")
+        dialog.protocol("WM_DELETE_WINDOW", self._close_dialog)
+        dialog.bind("<Escape>", lambda e: self._close_dialog())
+        dialog.bind("<Control-Return>", lambda e: self.update_selected_song() if edit else self.add_song())
+        dialog.update_idletasks()
+        dialog.geometry(f"+{self.root.winfo_rootx() + 100}+{self.root.winfo_rooty() + 70}")
+        dialog.grab_set()
+        first.focus_set()
+
+    def _close_dialog(self):
+        if self.dialog is not None:
+            self.dialog.grab_release()
+            self.dialog.destroy()
+            self.dialog = None
+        self.current_edit_id = None
+        self.on_song_selected()
+
+    def _mark_changed(self):
+        self.dirty = True
+        self.var_status.set("Unsaved changes · Save library to keep your edits")
+
+    def close(self):
+        if self.dirty and not messagebox.askyesno("Unsaved library", "Close without saving your library changes?", parent=self.root):
+            return
+        self.root.destroy()
 
     # ---------- file browsing ----------
 
     def browse_audio(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select audio file",
+            title="Select audio file", parent=self.dialog or self.root,
             filetypes=[
                 ("Audio files", "*.mp3 *.wav *.flac *.m4a"),
                 ("All files", "*.*"),
@@ -458,12 +501,11 @@ class SongCollectorApp:
 
     def browse_cover(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select album cover (PNG)",
+            title="Select album cover (PNG)", parent=self.dialog or self.root,
             filetypes=[("PNG images", "*.png"), ("All files", "*.*")],
         )
         if path:
             self.var_coverpath.set(path)
-            self.show_cover_image(path)
 
     # ---------- core actions ----------
 
@@ -471,9 +513,14 @@ class SongCollectorApp:
         data = self._read_form_data()
         if data is None:
             return
-        self.collector.add_song(**data)
+        song = self.collector.add_song(**data)
+        self._mark_changed()
         self.refresh_list()
-        self.clear_form()
+        self._close_dialog()
+        if self.tree.exists(str(song.id)):
+            self.tree.selection_set(str(song.id))
+            self.tree.see(str(song.id))
+            self.on_song_selected()
 
     def update_selected_song(self) -> None:
         if self.current_edit_id is None:
@@ -486,7 +533,9 @@ class SongCollectorApp:
         if not ok:
             messagebox.showerror("Update", "Could not find song to update.")
             return
+        self._mark_changed()
         self.refresh_list()
+        self._close_dialog()
 
     def clear_form(self) -> None:
         self.var_title.set("")
@@ -534,38 +583,48 @@ class SongCollectorApp:
         }
 
     def refresh_list(self, songs: List[Song] | None = None) -> None:
+        selected = self.tree.selection()
         if songs is None:
-            songs = self.collector.list_songs()
-        self.lst_songs.delete(0, tk.END)
-        for s in songs:
-            has_file = "🎵" if s.filepath else "—"
-            text = (
-                f"[{s.id}] {s.title} – {s.artist} "
-                f"({s.genre}, {s.duration_seconds}s, rating {s.rating}, file {has_file})"
-            )
-            self.lst_songs.insert(tk.END, text)
+            keyword = self.var_search.get().strip()
+            songs = self.collector.search_smart(keyword) if keyword else self.collector.list_songs()
+            key = self.var_sort.get()
+            keys = {"Title": lambda s: s.title.lower(), "Duration": lambda s: s.duration_seconds,
+                    "Rating": lambda s: -s.rating, "Newest": lambda s: -s.id, "Oldest": lambda s: s.id}
+            songs.sort(key=keys[key])
+        self.tree.delete(*self.tree.get_children())
+        for song in songs:
+            minutes, seconds = divmod(song.duration_seconds, 60)
+            self.tree.insert("", "end", iid=str(song.id), values=(song.title, song.artist, song.genre, f"{minutes}:{seconds:02d}", f"{song.rating} / 5"))
+        keep = [iid for iid in selected if self.tree.exists(iid)]
+        if keep:
+            self.tree.selection_set(keep)
+        self.count_label.configure(text=f"{len(self.collector.list_songs())} songs in your collection")
         self.update_total_duration_label(songs)
+        if not songs:
+            filtered = bool(self.collector.list_songs())
+            self.empty_title.configure(text="No matching songs" if filtered else "Your library starts here")
+            self.empty_hint.configure(text="Try another title or artist keyword." if filtered else "Add a song or load an existing JSON library.")
+            self.empty_button.configure(text="Clear search" if filtered else "Add your first song", command=self.show_all if filtered else self.open_song_dialog)
+            self.empty.place(relx=.5, rely=.5, anchor="center")
+        else:
+            self.empty.place_forget()
+        for button in (self.play_all_button, self.random_button):
+            button.configure(state="normal" if self.collector.list_songs() else "disabled")
+        self.on_song_selected()
 
     def _get_selected_ids(self) -> List[int]:
-        selection = list(self.lst_songs.curselection())
-        ids: List[int] = []
-        for index in selection:
-            text = self.lst_songs.get(index)
-            try:
-                id_part = text.split("]")[0]
-                song_id = int(id_part.strip("["))
-                ids.append(song_id)
-            except Exception:
-                pass
-        return ids
+        return [int(iid) for iid in self.tree.selection()]
 
     def delete_selected(self) -> None:
         ids = self._get_selected_ids()
         if not ids:
             messagebox.showinfo("Delete", "Please select at least one song.")
             return
+        if not messagebox.askyesno("Remove songs", f"Remove {len(ids)} song(s) from the library? Their files will be kept."):
+            return
         for song_id in ids:
             self.collector.remove_song_by_id(song_id)
+        self._mark_changed()
         self.refresh_list()
         self.clear_form()
 
@@ -573,22 +632,22 @@ class SongCollectorApp:
 
     def on_song_selected(self, event: tk.Event | None = None) -> None:
         ids = self._get_selected_ids()
-        if len(ids) != 1:
-            self.current_edit_id = None
-            self.lbl_cover.configure(text="Album cover preview\n(PNG)", image="")
-            self.cover_image = None
+        for index, button in enumerate(self.selection_buttons):
+            button.configure(state="normal" if ids and (index != 1 or len(ids) == 1) else "disabled")
+        song = self.collector.get_song_by_id(ids[0]) if len(ids) == 1 else None
+        self.cover_image = None
+        self.lbl_cover.configure(image="", text="No cover selected")
+        if song is None:
+            self.detail_title.configure(text=f"{len(ids)} songs selected" if ids else "Select a song")
+            self.detail_meta.configure(text="Play or remove the selected songs." if ids else "Browse your library to see details.")
+            self.detail_file.configure(text="")
             return
-        song = self.collector.get_song_by_id(ids[0])
-        if not song:
-            self.current_edit_id = None
-            return
-        self.current_edit_id = song.id
-        self._load_song_into_form(song)
-        if song.cover_path and os.path.exists(song.cover_path):
+        self.detail_title.configure(text=song.title)
+        minutes, seconds = divmod(song.duration_seconds, 60)
+        self.detail_meta.configure(text=f"{song.artist}\n\n{song.genre or 'No genre'}\n{minutes}:{seconds:02d}  ·  Rating {song.rating} / 5")
+        self.detail_file.configure(text=(os.path.basename(song.filepath) + ("\nAudio file missing" if not os.path.isfile(song.filepath) else "")) if song.filepath else "No audio file linked")
+        if song.cover_path:
             self.show_cover_image(song.cover_path)
-        else:
-            self.lbl_cover.configure(text="Album cover preview\n(PNG)", image="")
-            self.cover_image = None
 
     def _load_song_into_form(self, song: Song) -> None:
         self.var_title.set(song.title)
@@ -625,15 +684,14 @@ class SongCollectorApp:
         if not song.filepath:
             messagebox.showinfo("Random", "Random song has no audio file.")
             return
-        index = None
-        for i in range(self.lst_songs.size()):
-            if self.lst_songs.get(i).startswith(f"[{song.id}]"):
-                index = i
-                break
-        if index is not None:
-            self.lst_songs.selection_clear(0, tk.END)
-            self.lst_songs.selection_set(index)
-            self.lst_songs.see(index)
+        iid = str(song.id)
+        if self.tree.exists(iid):
+            self.tree.selection_set(iid)
+            self.tree.see(iid)
+            self.on_song_selected()
+        if not os.path.isfile(song.filepath):
+            messagebox.showinfo("Play", "The linked audio file is missing.")
+            return
         self._open_audio(song.filepath)
 
     def _play_song_ids(self, ids: List[int]) -> None:
@@ -661,30 +719,22 @@ class SongCollectorApp:
                     f.write(p + "\n")
                 playlist_path = f.name
             self._open_audio(playlist_path)
-        except Exception as e:
+        except OSError as e:
             messagebox.showerror("Play", f"Could not create playlist:\n{e}")
 
     def _open_audio(self, path: str) -> None:
         try:
             os.startfile(path)  # type: ignore[attr-defined]
-        except Exception as e:
+        except (OSError, AttributeError) as e:
             messagebox.showerror("Play", f"Cannot open file:\n{e}")
 
     # ---------- search / sort / stats ----------
 
     def smart_search(self) -> None:
-        keyword = self.var_search.get().strip()
-        if not keyword:
-            messagebox.showinfo("Search", "Enter keyword first.")
-            return
-        results = self.collector.search_smart(keyword)
-        if not results:
-            messagebox.showinfo("Search", "No matching songs.")
-        self.refresh_list(results)
+        self.refresh_list()
 
     def apply_sort(self) -> None:
-        key = self.var_sort.get()
-        self.collector.sort_songs(key)
+        self.collector.sort_songs(self.var_sort.get())
         self.refresh_list()
 
     def show_stats(self) -> None:
@@ -707,11 +757,14 @@ class SongCollectorApp:
             return
         try:
             self.collector.save_to_file(filename)
-            messagebox.showinfo("Save", "Library saved successfully.")
-        except Exception as e:
+            self.dirty = False
+            self.var_status.set(f"Saved · {os.path.basename(filename)}")
+        except OSError as e:
             messagebox.showerror("Save", f"Could not save library:\n{e}")
 
     def load_library(self) -> None:
+        if self.dirty and not messagebox.askyesno("Unsaved library", "Replace the current library without saving its changes?"):
+            return
         filename = filedialog.askopenfilename(
             title="Load library",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
@@ -720,22 +773,25 @@ class SongCollectorApp:
             return
         try:
             self.collector.load_from_file(filename)
+            self.var_search.set("")
+            self.tree.selection_remove(self.tree.selection())
             self.refresh_list()
-            messagebox.showinfo("Load", "Library loaded successfully.")
-        except Exception as e:
+            self.dirty = False
+            self.var_status.set(f"Loaded · {os.path.basename(filename)}")
+        except (OSError, ValueError, TypeError, KeyError, OverflowError) as e:
             messagebox.showerror("Load", f"Could not load library:\n{e}")
 
     # ---------- cover & totals ----------
 
     def show_cover_image(self, path: str) -> None:
         try:
-            img = tk.PhotoImage(file=path)
-        except Exception:
-            self.lbl_cover.configure(text="Cannot load image", image="")
+            with Image.open(path) as source:
+                source.thumbnail((210, 210))
+                self.cover_image = ImageTk.PhotoImage(source.copy(), master=self.root)
+            self.lbl_cover.configure(image=self.cover_image, text="")
+        except (OSError, ValueError, tk.TclError):
+            self.lbl_cover.configure(text="Cover unavailable", image="")
             self.cover_image = None
-            return
-        self.cover_image = img
-        self.lbl_cover.configure(image=self.cover_image, text="")
 
     def update_total_duration_label(self, songs: List[Song]) -> None:
         total_sec = self.collector.total_duration(songs)
@@ -747,6 +803,7 @@ class SongCollectorApp:
 
 
 def main() -> None:
+    ttk.utility.enable_high_dpi_awareness()
     root = tk.Tk()
     app = SongCollectorApp(root)
     root.mainloop()
