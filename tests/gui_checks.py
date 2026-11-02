@@ -163,22 +163,22 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(reopened.list_songs(), [])
         self.assertFalse(self.app.dirty)
 
-    def test_browse_external_copy_link_and_cancel(self):
+    def test_browse_external_automatically_copies_and_reuses(self):
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / 'external.mp3'
             source.write_bytes(b'original audio')
-            with patch('song_collector_gui.filedialog.askopenfilename', return_value=str(source)), patch('song_collector_gui.messagebox.askyesnocancel', return_value=True):
+            self.app.open_song_dialog()
+            with patch('song_collector_gui.filedialog.askopenfilename', return_value=str(source)), patch('song_collector_gui.messagebox.askyesnocancel') as popup, patch('song_collector_gui.messagebox.showwarning') as warning:
                 self.app.browse_audio()
-            reference = self.app.var_filepath.get()
+                reference = self.app.var_filepath.get()
+                self.app.browse_audio()
+                popup.assert_not_called()
+                warning.assert_not_called()
+            self.assertEqual(self.app.var_filepath.get(), reference)
             self.assertTrue(reference.startswith('media/audio/'))
             self.assertEqual((self.app.library.media.root / reference).read_bytes(), source.read_bytes())
-            with patch('song_collector_gui.messagebox.askyesnocancel', return_value=None):
-                self.app._set_browsed_media(source, 'audio', self.app.var_filepath)
-            self.assertEqual(self.app.var_filepath.get(), reference)
-            with patch('song_collector_gui.messagebox.askyesnocancel', return_value=False):
-                self.app._set_browsed_media(source, 'audio', self.app.var_filepath)
-            self.assertEqual(Path(self.app.var_filepath.get()), source)
             self.assertTrue(source.exists())
+            self.app._close_dialog()
 
     def test_relative_playback_and_cover_preview_from_other_directory(self):
         import os
@@ -279,6 +279,76 @@ class GuiTests(unittest.TestCase):
         self.app.var_title.set('Cancelled')
         self.app._close_dialog()
         self.assertEqual(song.title, 'A title')
+
+    def test_autofill_keeps_manual_fields_rating_and_existing_edit_metadata(self):
+        from metadata_extractor import AudioMetadata
+        self.app.open_song_dialog()
+        self.app.var_title.set('Manual title')
+        self.app.var_genre.set('Manual genre')
+        self.app.var_rating.set('5')
+        detected = AudioMetadata(title='Detected', artist='Detected artist', duration_seconds=99, genre='Detected genre')
+        with patch('song_collector_gui.messagebox.askyesno') as popup:
+            self.app._apply_detected_metadata(detected, '')
+            popup.assert_not_called()
+        self.assertEqual(self.app.var_title.get(), 'Manual title')
+        self.assertEqual(self.app.var_artist.get(), 'Detected artist')
+        self.assertEqual(self.app.var_duration.get(), '99')
+        self.assertEqual(self.app.var_genre.get(), 'Manual genre')
+        self.assertEqual(self.app.var_rating.get(), '5')
+        self.app._close_dialog()
+        song = self.add_song('Saved title', 'Saved artist')
+        self.app.tree.selection_set(str(song.id))
+        self.app.open_song_dialog(edit=True)
+        self.app._apply_detected_metadata(detected, '')
+        self.assertEqual(self.app.var_title.get(), 'Saved title')
+        self.assertEqual(self.app.var_artist.get(), 'Saved artist')
+        self.app._close_dialog()
+
+    def test_sidecar_is_copied_and_saved_while_manual_cover_is_preserved(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            audio = root / 'Unique - Track.mp3'
+            audio.write_bytes(b'audio without tags')
+            cover = root / 'Unique - Track.png'
+            Image.new('RGB', (20, 20), 'magenta').save(cover)
+            self.app.open_song_dialog()
+            with patch('song_collector_gui.filedialog.askopenfilename', return_value=str(audio)):
+                self.app.browse_audio()
+            automatic = self.app.var_coverpath.get()
+            self.assertTrue(automatic.startswith('media/covers/'))
+            self.assertIsNotNone(self.app.form_cover_image)
+            with patch('song_collector_gui.filedialog.askopenfilename', return_value=str(audio)):
+                self.app.browse_audio()
+            self.assertEqual(self.app.var_coverpath.get(), automatic)
+            manual = root / 'manual.png'
+            Image.new('RGB', (20, 20), 'blue').save(manual)
+            with patch('song_collector_gui.filedialog.askopenfilename', return_value=str(manual)):
+                self.app.browse_cover()
+            selected = self.app.var_coverpath.get()
+            with patch('song_collector_gui.filedialog.askopenfilename', return_value=str(audio)):
+                self.app.browse_audio()
+            self.assertEqual(self.app.var_coverpath.get(), selected)
+            self.app.var_duration.set('10')
+            self.app.add_song()
+            reopened = self.app.library.read(self.app.library.path, SongCollector)
+            self.assertEqual(reopened.list_songs()[0].cover_path, selected)
+            self.assertEqual(audio.read_bytes(), b'audio without tags')
+
+    def test_existing_song_without_cover_gets_local_artwork_without_metadata_changes(self):
+        audio = self.app.library.media.root / 'Existing Artwork Song.mp3'
+        audio.write_bytes(b'audio')
+        sidecar = audio.with_suffix('.png')
+        Image.new('RGB', (20, 20), 'orange').save(sidecar)
+        song = self.add_song('User title', 'User artist')
+        song.filepath = 'Existing Artwork Song.mp3'
+        before = song.to_dict()
+        self.app.tree.selection_set(str(song.id))
+        self.app.on_song_selected()
+        self.assertTrue(song.cover_path)
+        self.assertIsNotNone(self.app.cover_image)
+        for key in ('title', 'artist', 'duration_seconds', 'genre', 'rating', 'id'):
+            self.assertEqual(song.to_dict()[key], before[key])
+        self.assertEqual(self.app.library.read(self.app.library.path, SongCollector).get_song_by_id(song.id).cover_path, song.cover_path)
 
 
 if __name__ == '__main__':

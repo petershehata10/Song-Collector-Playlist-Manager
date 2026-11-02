@@ -181,6 +181,60 @@ class LocalLibraryTests(unittest.TestCase):
             self.store.export(collector, self.root / 'song.mp3')
         self.assertEqual(self.store.original.read_bytes(), before)
 
+    def test_repaired_paths_are_persisted_without_replacing_current_library(self):
+        self.store.startup(SongCollector)
+        audio = self.store.media.folder('audio') / 'kept.mp3'
+        audio.write_bytes(b'kept audio')
+        cover = self.store.media.folder('covers') / 'kept.png'
+        cover.write_bytes(b'kept cover')
+        collector = SongCollector()
+        song = collector.add_song('User title', 'User artist', 42, 'User genre', 2,
+                                  r'M:\Books VUT\old\kept.mp3', r'M:\Books VUT\old\kept.png')
+        original = song.to_dict()
+        self.store.save(collector)
+        reopened = WorkingLibrary(self.root).startup(SongCollector)
+        saved = json.loads(self.store.path.read_text())
+        self.assertEqual(len(saved['songs']), 1)
+        self.assertEqual(saved['songs'][0]['filepath'], 'media/audio/kept.mp3')
+        self.assertEqual(saved['songs'][0]['cover_path'], 'media/covers/kept.png')
+        for field in ('title', 'artist', 'duration_seconds', 'genre', 'rating', 'id'):
+            self.assertEqual(saved['songs'][0][field], original[field])
+        self.assertEqual(reopened.get_song_by_id(song.id).filepath, 'media/audio/kept.mp3')
+
+    def test_ambiguous_legacy_paths_remain_unchanged_across_folders(self):
+        self.store.startup(SongCollector)
+        for path in (self.root / 'same.mp3', self.store.media.folder('audio') / 'same.mp3'):
+            path.write_bytes(b'candidate')
+        old = r'Q:\missing\same.mp3'
+        self.assertEqual(self.store.media.normalize(old, 'audio'), old)
+        self.assertEqual(self.store.media.normalize('media/audio/same.mp3', 'audio'), 'media/audio/same.mp3')
+
+    def test_project_move_recovers_old_project_absolute_paths_and_reopens(self):
+        self.store.startup(SongCollector)
+        asset = self.store.media.folder('audio') / 'moved.mp3'
+        asset.touch()
+        self.assertEqual(self.store.media.normalize(r'Q:\previous-project\media\audio\moved.mp3', 'audio'), 'media/audio/moved.mp3')
+        collector = SongCollector()
+        collector.add_song('Moved', 'Artist', 1, '', 3, 'media/audio/moved.mp3', '')
+        self.store.save(collector)
+        # Copy the complete miniature project to a different directory.
+        import shutil
+        moved = Path(self.temporary.name) / 'new-project'
+        shutil.copytree(self.root, moved)
+        other = WorkingLibrary(moved)
+        reopened = other.startup(SongCollector)
+        self.assertEqual(other.media.resolve(reopened.list_songs()[0].filepath, 'audio'), moved / 'media/audio/moved.mp3')
+
+    def test_repeated_external_selection_and_renamed_identical_file_reuse_copy(self):
+        source = Path(self.temporary.name) / 'repeat.mp3'
+        source.write_bytes(b'same recording')
+        first = self.store.media.copy_asset(source, 'audio')
+        self.assertEqual(self.store.media.copy_asset(source, 'audio'), first)
+        renamed = source.with_name('renamed.mp3')
+        renamed.write_bytes(source.read_bytes())
+        self.assertEqual(self.store.media.copy_asset(renamed, 'audio'), first)
+        self.assertEqual(len(list(self.store.media.folder('audio').glob('*.mp3'))), 1)
+
 
 if __name__ == '__main__':
     unittest.main()

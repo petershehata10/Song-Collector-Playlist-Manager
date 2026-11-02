@@ -1,6 +1,6 @@
 # Smart Song Collector & Playlist Manager
 
-A local Windows desktop music library built with Python and Tkinter. Phase 1 modernized the GUI; Phase 2 adds project-local media references, automatic loading, and safe automatic saving while retaining the Song / SongCollector model and JSON library format. Playlist creation and management are outside this phase.
+A local Windows desktop music library built with Python and Tkinter. Phase 1 modernized the GUI; Phase 2 adds project-local media references, automatic loading, and safe automatic saving; Phase 3 adds local Mutagen metadata and artwork extraction while retaining the Song / SongCollector model and JSON library format. Playlist creation and management are outside this phase.
 
 ## Setup and run (PowerShell)
 
@@ -20,12 +20,12 @@ uv --cache-dir .uv-cache venv --python .python/cpython-3.13.14-windows-x86_64-no
 uv --cache-dir .uv-cache pip install --python .venv/Scripts/python.exe -r requirements.txt
 ```
 
-Dependencies are pinned in `requirements.txt`: ttkbootstrap 1.20.4 provides modern ttk widgets and themes; Pillow 12.3.0 (also required by ttkbootstrap) resizes cover previews without distorting their proportions. There are no network services or music downloads. See the [ttkbootstrap theme documentation](https://www.ttkbootstrap.org/en/latest/themes.html).
+Dependencies are pinned in `requirements.txt`: ttkbootstrap 1.20.4 provides modern ttk widgets and themes; Pillow 12.3.0 (also required by ttkbootstrap) resizes cover previews without distorting their proportions; Mutagen 1.47.0 reads local audio tags and embedded MP3 artwork. There are no network services or music downloads. See the [ttkbootstrap theme documentation](https://www.ttkbootstrap.org/en/latest/themes.html).
 
 ## Using the library
 
 - The sidebar opens the library, displays genre counts, imports/exports JSON, and switches appearance. Only implemented actions are shown.
-- Add songs with **Add song**. Edit a single selection with **Edit song** or by double-clicking its row. Title and artist are required; enter a non-negative integer duration in seconds and an integer rating from 1 to 5. Audio and cover paths are optional.
+- Add songs with **Add song**. Edit a single selection with **Edit song** or by double-clicking its row. Choosing an audio file reads local title, artist, genre, duration, nearby JPEG/PNG artwork, and embedded MP3 APIC artwork. Missing tags produce filename suggestions. Manual fields and existing saved metadata are preserved automatically; selecting audio fills only eligible untouched fields. Rating stays manual. Title and artist are required; enter a non-negative integer duration in seconds and an integer rating from 1 to 5. Audio and cover paths are optional.
 - Search title/artist words using **Search** or Enter. This retains the existing whole-word similarity search, so partial words such as `danc` do not match `Dancing`. Clear restores the full collection. Sorting preserves the active search; rating sorts highest first, duration shortest first.
 - Use Ctrl/Shift selection for several rows. Play selected, play all, or choose a random song. Playback uses the Windows default player; multiple files are passed through a temporary M3U as before. Player support determines queue behavior.
 - The inspector shows the selected song, a bounded cover preview, and audio-file availability. Common Pillow image formats work; PNG remains supported.
@@ -34,7 +34,9 @@ Dependencies are pinned in `requirements.txt`: ttkbootstrap 1.20.4 provides mode
 - On first startup, if the working file does not exist, the bundled `My Favourite Library.json` is imported. Old absolute Windows paths are matched by filename to existing root media, with IDs, metadata, and the next ID retained. The original JSON and root media are never rewritten or moved. If neither JSON exists, an empty working library is created.
 - **Import library…** replaces the displayed collection and automatically saves it to the working file. It does not modify the source JSON. Failed imports keep the current collection. If there are unsaved changes after a save failure, replacing them requires confirmation.
 - **Export library…** writes a JSON copy to a chosen filename. Exporting never changes the working location. An export cannot overwrite the original `My Favourite Library.json` or use a non-JSON filename. Exporting a recovery copy does not hide a failed working save.
-- Browse external audio or covers and choose **Yes** to copy into `media/audio` or `media/covers`, **No** to keep an absolute link, or **Cancel** to leave the field unchanged. Name collisions use `name (2).ext`, `name (3).ext`, etc.; existing files and originals are kept. Files already in the project are referenced in place. Copying occurs when browsing; cancelling the song dialog afterwards leaves the copy in place.
+- Browsing external audio or covers automatically copies them into `media/audio` or `media/covers`, without a copy-or-link popup. Identical existing local copies are reused after a byte comparison. Name collisions use `name (2).ext`, `name (3).ext`, etc.; existing files and originals are kept. Files already in the project are referenced in place. Copying occurs when browsing; cancelling the song dialog afterwards leaves the copy in place.
+- Startup persists verified local path repairs. Legacy Windows basenames are checked across the project root and the appropriate media folder together; ambiguous or missing matches keep their original reference. No existing library is replaced with the bundled sample.
+- Artwork detection first reads embedded MP3 APIC pictures (front cover preferred), independently of audio-tag/duration parsing. Valid JPG/PNG sidecars with matching track names come next, followed by unambiguous `cover.jpg` / `folder.jpg` equivalents. Project media folders are searched too. Artwork is validated with Pillow, saved locally, and reused without overwriting files. A manually selected cover is never replaced; missing artwork shows the existing clean placeholder.
 - Missing media keeps its path and metadata. The inspector shows missing audio and unavailable cover images; use Edit to reconnect files.
 
 Keyboard: Ctrl+N adds, Ctrl+F focuses search, Ctrl+S exports, Ctrl+O imports; Delete removes selected table rows with confirmation. Escape cancels an add/edit dialog; Ctrl+Enter submits it. Tab moves through controls.
@@ -63,15 +65,15 @@ Precise Git ignore rules cover `/data/library.json`, its atomic-save temporary f
 .venv\Scripts\python.exe -m unittest discover -s tests -p gui_checks.py -v
 ```
 
-The default suite has **21 tests** for the existing model and Phase 2 storage, including migration of the eight-song fixture, Windows/relative paths, missing files, import/ID preservation, copying/collisions, corrupt JSON, and failed atomic replacement. The explicit GUI suite has **17 checks** covering the existing layout and the full autosave/import/recovery paths, real working-directory changes, media browsing choices, and relative cover/playback resolution. The GUI checks require a graphical Windows session. All test-library writes use temporary directories, and playback is mocked.
+The default suite has **34 tests** for the model, storage and metadata extraction, including migration of the eight-song fixture, Windows/relative paths, missing files, import/ID preservation, copying/collisions, corrupt JSON, and failed atomic replacement. The explicit GUI suite has **20 checks** covering the existing layout, metadata/manual-cover preservation, automatic media copying and the full autosave/import/recovery paths, real working-directory changes, media browsing choices, and relative cover/playback resolution. The GUI checks require a graphical Windows session. All test-library writes use temporary directories, and playback is mocked.
 
 Verification also migrated the actual repository's eight-song library: all 16 relative audio/cover paths resolved. SHA-256 hashes confirmed that the original JSON and all 16 root media files were unchanged. `git check-ignore` confirmed that working data and imported media are ignored.
 
 ## Manual Phase 2 checks
 
-1. From the project folder, run `.venv\Scripts\python.exe song_collector_gui.py`. The eight songs should appear without importing anything. Select each song: its cover should display and audio should play in your default Windows player. `data/library.json` should contain root-relative media filenames, IDs 1–8, and `next_id` 9 on the initial migration.
+1. From the project folder, run `.venv\Scripts\python.exe song_collector_gui.py`. Your current saved songs should appear without importing anything; startup never resets an existing library to the eight-song sample. Select each song: its cover should display and audio should play in your default Windows player. `data/library.json` should contain root-relative media filenames, IDs 1–8, and `next_id` 9 on the initial migration.
 2. Add a song called `Phase 2 test` with artist `Test`, duration `10`, rating `3`, and no media. Check for the automatically-saved footer. Close and reopen: it should still exist. Edit its rating to `4`, reopen again, then remove it and reopen once more. Each operation should persist without exporting.
-3. Add a test song and Browse to an audio file **outside the repository**. Choose Yes. Repeat for an external PNG cover. Check that copies exist under `media/audio` and `media/covers`, that original files still exist, and that the JSON uses relative paths. Select the same external filename again to check that an existing copy is not overwritten. Choose No for a different selection to test external linking; Cancel should leave the field unchanged.
+3. Add a test song and Browse to an audio file **outside the repository**. The file should copy automatically without a popup. Repeat for an external PNG/JPG cover. Check that copies exist under `media/audio` and `media/covers`, that original files still exist, and that the JSON uses relative paths. Select the same external filename again to check that an existing copy is not overwritten. Selecting the same file again should reuse the existing copy. Cancel the native file picker to leave the field unchanged. Check embedded artwork or matching sidecars, then manually select another cover and browse audio again: your manual cover should stay selected.
 4. Export to a new JSON file **outside the repository**, then import that export. Song IDs, ratings, genres, and durations should match. Try importing a separate malformed JSON file: an error should appear and the current songs should stay unchanged. A failed working save must leave an unsaved warning even after a recovery export.
 5. Edit only the test song's audio path to `media/audio/does-not-exist.mp3` and its cover path to `media/covers/does-not-exist.png`. The inspector should report missing/unavailable media and playback should give a useful message. The song must remain after reopening. Remove this test record when done.
 6. Verify launch-directory independence with the following commands from the project folder. Check covers and playback again:
@@ -92,7 +94,7 @@ For a manual **corrupt-startup check**, use an isolated disposable copy rather t
 $project = (Get-Location).Path
 $trial = Join-Path $env:TEMP ("SongCollector-trial-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $trial | Out-Null
-Copy-Item -LiteralPath .\song_collector_gui.py,.\media_library.py -Destination $trial
+Copy-Item -LiteralPath .\song_collector_gui.py,.\media_library.py,.\metadata_extractor.py -Destination $trial
 New-Item -ItemType Directory -Path (Join-Path $trial 'data') | Out-Null
 Set-Content -LiteralPath (Join-Path $trial 'data/library.json') -Value '{broken' -Encoding UTF8
 & "$project\.venv\Scripts\python.exe" (Join-Path $trial 'song_collector_gui.py')

@@ -14,3 +14,15 @@ __pycache__/
 !/media/audio/.gitkeep
 /media/covers/*
 !/media/covers/.gitkeep
+
+# Local music and artwork stored in the project root
+/*.mp3
+/*.png
+
+# Personal song libraries
+/My Favourite Library.json
+/data/library.json
+
+# Imported media
+/media/audio/
+/media/covers/

@@ -7,11 +7,13 @@ import json
 import random
 import tempfile
 import tkinter as tk
+from io import BytesIO
 from tkinter import messagebox, filedialog, font as tkfont
 import ttkbootstrap as ttk
 from PIL import Image, ImageTk
 from pathlib import Path, PureWindowsPath
 from media_library import PROJECT_ROOT, LIBRARY_ERRORS, WorkingLibrary, atomic_write_json
+from metadata_extractor import AudioMetadata, extract_audio_metadata, save_embedded_artwork
 
 
 # ========== DATA MODEL ==========
@@ -244,12 +246,18 @@ class SongCollectorApp:
         self.dark_mode = True
         self.collector = SongCollector()
         self.cover_image = None
+        self.form_cover_image = None
         self.current_edit_id = None
         self.dialog = None
         self.dirty = False
         self.style = ttk.Style("darkly")
         for name in ("title", "artist", "duration", "genre", "rating", "filepath", "coverpath"):
             setattr(self, "var_" + name, tk.StringVar(root))
+        self._automatic_cover_path = ""
+        self._form_changes: set[str] = set()
+        self._suppress_form_tracking = False
+        for name in ("title", "artist", "duration", "genre", "rating", "filepath", "coverpath"):
+            getattr(self, "var_" + name).trace_add("write", lambda *_args, field=name: self._track_form_change(field))
         self.var_search = tk.StringVar(root)
         self.var_sort = tk.StringVar(root, value="Title")
         self.var_total = tk.StringVar(root)
@@ -438,8 +446,8 @@ class SongCollectorApp:
             self.current_edit_id = ids[0]
             self._load_song_into_form(self.collector.get_song_by_id(ids[0]))
         else:
-            self.var_rating.set("3")
-            self.var_duration.set("0")
+            self._set_form_value("rating", "3")
+            self._set_form_value("duration", "0")
         dialog = tk.Toplevel(self.root)
         self.dialog = dialog
         dialog.title("Edit song" if edit else "Add song")
@@ -459,9 +467,11 @@ class SongCollectorApp:
                 first = entry
             if name in ("filepath", "coverpath"):
                 ttk.Button(body, style="Secondary.TButton", text="Browse…", command=self.browse_audio if name == "filepath" else self.browse_cover).grid(row=row, column=2, padx=(8, 0))
-        ttk.Label(body, text="Audio and cover files are optional. Duration is entered manually.", style="Muted.TLabel").grid(row=8, column=0, columnspan=3, sticky="w", pady=(10, 16))
+        self.form_cover_label = ttk.Label(body, text="No detected artwork", anchor="center")
+        self.form_cover_label.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(6, 8))
+        ttk.Label(body, text="Audio and cover files are optional. Rating remains manual.", style="Muted.TLabel").grid(row=9, column=0, columnspan=3, sticky="w", pady=(2, 16))
         buttons = ttk.Frame(body)
-        buttons.grid(row=9, column=0, columnspan=3, sticky="e")
+        buttons.grid(row=10, column=0, columnspan=3, sticky="e")
         ttk.Button(buttons, style="Secondary.TButton", text="Cancel", command=self._close_dialog).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="Save changes" if edit else "Add song", style="Accent.TButton", command=self.update_selected_song if edit else self.add_song).pack(side="left")
         dialog.protocol("WM_DELETE_WINDOW", self._close_dialog)
@@ -470,6 +480,7 @@ class SongCollectorApp:
         dialog.update_idletasks()
         dialog.geometry(f"+{self.root.winfo_rootx() + 100}+{self.root.winfo_rooty() + 70}")
         dialog.grab_set()
+        self._update_form_cover_preview(self.var_coverpath.get())
         first.focus_set()
 
     def _close_dialog(self):
@@ -478,6 +489,7 @@ class SongCollectorApp:
             self.dialog.destroy()
             self.dialog = None
         self.current_edit_id = None
+        self._form_changes.clear()
         self.on_song_selected()
 
     def _load_working_library(self):
@@ -524,38 +536,50 @@ class SongCollectorApp:
             ],
         )
         if path:
-            self._set_browsed_media(path, "audio", self.var_filepath)
+            source = Path(path).resolve()
+            if not self._set_browsed_media(source, "audio", self.var_filepath):
+                return
+            detected = extract_audio_metadata(source, self._artwork_folders())
+            cover_path = ""
+            if self._can_detect_cover():
+                try:
+                    cover_path = self._store_detected_cover(source, detected)
+                except OSError as error:
+                    messagebox.showerror("Artwork import", f"Could not save artwork. The audio selection is still available.\n{error}", parent=self.dialog or self.root)
+            self._apply_detected_metadata(detected, cover_path)
+
+    def _artwork_folders(self):
+        return (self.library.media.root, self.library.media.folder("covers"), self.library.media.folder("audio"))
+
+    def _can_detect_cover(self):
+        current = self.var_coverpath.get().strip()
+        return "coverpath" not in self._form_changes and (not current or current == self._automatic_cover_path)
+
+    def _store_detected_cover(self, source, metadata):
+        if metadata.artwork:
+            cover = save_embedded_artwork(metadata.artwork, metadata.artwork_extension,
+                                          self.library.media.folder("covers"), source.stem)
+            return self.library.media.reference(cover)
+        if metadata.cover_path:
+            return self.library.media.copy_asset(metadata.cover_path, "covers")
+        return ""
 
     def browse_cover(self) -> None:
         path = filedialog.askopenfilename(
-            title="Select album cover (PNG)", parent=self.dialog or self.root,
-            filetypes=[("PNG images", "*.png"), ("All files", "*.*")],
+            title="Select album cover", parent=self.dialog or self.root,
+            filetypes=[("Cover images", "*.png *.jpg *.jpeg"), ("All files", "*.*")],
         )
-        if path:
-            self._set_browsed_media(path, "covers", self.var_coverpath)
+        if path and self._set_browsed_media(path, "covers", self.var_coverpath):
+            self._update_form_cover_preview(self.var_coverpath.get())
 
-    def _set_browsed_media(self, filename, kind, variable):
-        source = Path(filename).resolve()
+    def _set_browsed_media(self, filename, kind, variable) -> bool:
         try:
-            source.relative_to(self.library.media.root)
-            external = False
-        except ValueError:
-            external = True
-        copy = False
-        if external:
-            copy = messagebox.askyesnocancel(
-                "Keep media in this project?",
-                f"Copy {source.name} into media/{kind}?\n\nYes: copy into the project.\nNo: keep a link to the original file.\nCancel: leave this field unchanged.\nThe original file is never moved or deleted.",
-                parent=self.dialog or self.root,
-            )
-            if copy is None:
-                return
-        try:
-            reference = (self.library.media.copy_asset(source, kind) if copy
-                         else self.library.media.reference(source))
+            reference = self.library.media.copy_asset(filename, kind)
             variable.set(reference)
+            return True
         except OSError as error:
             messagebox.showerror("Media import", f"Could not copy this file. The form has not changed.\n{error}", parent=self.dialog or self.root)
+            return False
 
     # ---------- core actions ----------
 
@@ -587,14 +611,59 @@ class SongCollectorApp:
         self.refresh_list()
         self._close_dialog()
 
+    def _track_form_change(self, field: str) -> None:
+        if not self._suppress_form_tracking:
+            self._form_changes.add(field)
+
+    def _set_form_value(self, field: str, value: str) -> None:
+        self._suppress_form_tracking = True
+        try:
+            getattr(self, "var_" + field).set(value)
+        finally:
+            self._suppress_form_tracking = False
+
+    def _apply_detected_metadata(self, metadata: AudioMetadata, cover_path: str) -> None:
+        values = {
+            "title": metadata.title,
+            "artist": metadata.artist,
+            "duration": str(metadata.duration_seconds) if metadata.duration_seconds is not None else "",
+            "genre": metadata.genre,
+        }
+        for field, value in values.items():
+            current = getattr(self, "var_" + field).get().strip()
+            if value and field not in self._form_changes and not (self.current_edit_id is not None and current):
+                self._set_form_value(field, value)
+        if self._can_detect_cover():
+            self._set_form_value("coverpath", cover_path)
+            self._automatic_cover_path = cover_path
+        self._update_form_cover_preview(self.var_coverpath.get())
+
+    def _update_form_cover_preview(self, path: str = "", data: bytes | None = None) -> None:
+        if self.dialog is None or not hasattr(self, "form_cover_label") or not self.form_cover_label.winfo_exists():
+            return
+        try:
+            if data is not None:
+                source = Image.open(BytesIO(data))
+            elif path:
+                resolved = self.library.media.resolve(path, "covers")
+                if resolved is None or not resolved.is_file():
+                    raise OSError("Cover image is missing.")
+                source = Image.open(resolved)
+            else:
+                raise OSError("No cover image selected.")
+            source = source.copy()
+            source.thumbnail((210, 150), Image.Resampling.LANCZOS)
+            self.form_cover_image = ImageTk.PhotoImage(source, master=self.dialog)
+            self.form_cover_label.configure(image=self.form_cover_image, text="")
+        except (OSError, ValueError):
+            self.form_cover_image = None
+            self.form_cover_label.configure(image="", text="No detected artwork")
+
     def clear_form(self) -> None:
-        self.var_title.set("")
-        self.var_artist.set("")
-        self.var_duration.set("")
-        self.var_genre.set("")
-        self.var_rating.set("")
-        self.var_filepath.set("")
-        self.var_coverpath.set("")
+        self._automatic_cover_path = ""
+        for name in ("title", "artist", "duration", "genre", "rating", "filepath", "coverpath"):
+            self._set_form_value(name, "")
+        self._form_changes.clear()
         self.current_edit_id = None
 
     def _read_form_data(self) -> Dict[str, Any] | None:
@@ -697,17 +766,31 @@ class SongCollectorApp:
         self.detail_meta.configure(text=f"{song.artist}\n\n{song.genre or 'No genre'}\n{minutes}:{seconds:02d}  ·  Rating {song.rating} / 5")
         audio = self.library.media.resolve(song.filepath, "audio")
         self.detail_file.configure(text=(PureWindowsPath(song.filepath).name + ("\nAudio file missing" if audio is None or not audio.is_file() else "")) if song.filepath else "No audio file linked")
+        if not song.cover_path and audio is not None and audio.is_file():
+            detected = extract_audio_metadata(audio, self._artwork_folders())
+            try:
+                cover = self._store_detected_cover(audio, detected)
+            except OSError as error:
+                messagebox.showerror("Artwork import", f"Could not save artwork.\n{error}", parent=self.root)
+            else:
+                if cover:
+                    song.cover_path = cover
+                    self._mark_changed()
         if song.cover_path:
             self.show_cover_image(song.cover_path)
 
     def _load_song_into_form(self, song: Song) -> None:
-        self.var_title.set(song.title)
-        self.var_artist.set(song.artist)
-        self.var_duration.set(str(song.duration_seconds))
-        self.var_genre.set(song.genre)
-        self.var_rating.set(str(song.rating))
-        self.var_filepath.set(song.filepath)
-        self.var_coverpath.set(song.cover_path)
+        for name, value in {
+            "title": song.title,
+            "artist": song.artist,
+            "duration": str(song.duration_seconds),
+            "genre": song.genre,
+            "rating": str(song.rating),
+            "filepath": song.filepath,
+            "coverpath": song.cover_path,
+        }.items():
+            self._set_form_value(name, value)
+        self._form_changes.clear()
 
     # ---------- playback ----------
 

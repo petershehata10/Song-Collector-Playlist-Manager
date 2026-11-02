@@ -48,12 +48,19 @@ class MediaPaths:
         except ValueError:
             return str(path)
 
-    def resolve(self, value, kind, source_dir=None):
-        """Resolve references independently of cwd, including obsolete Windows paths.
+    def matching_local_files(self, value, kind):
+        name = PureWindowsPath(value).name.casefold()
+        matches = set()
+        for folder in (self.root, self.folder(kind)):
+            if folder.is_dir():
+                for path in folder.iterdir():
+                    if path.is_file() and path.name.casefold() == name:
+                        resolved = path.resolve()
+                        if resolved.is_relative_to(self.root):
+                            matches.add(resolved)
+        return sorted(matches)
 
-        Filename recovery is restricted to absolute legacy paths and known media
-        folders. Missing relative references keep their intended location.
-        """
+    def resolve(self, value, kind, source_dir=None):
         if not value:
             return None
         windows = PureWindowsPath(value)
@@ -61,20 +68,19 @@ class MediaPaths:
         absolute = path.is_absolute() or bool(windows.drive) or windows.is_absolute()
         foreign_windows = bool(windows.drive) and os.name != "nt"
         candidate = path if path.is_absolute() else self.root / path
-        if not foreign_windows and candidate.is_file():
+        exists = not foreign_windows and candidate.is_file()
+        # An exact internal reference is authoritative, even with duplicate basenames.
+        if exists and candidate.resolve().is_relative_to(self.root):
             return candidate.resolve()
+        matches = self.matching_local_files(value, kind)
+        if len(matches) == 1:
+            return matches[0]
+        if exists:
+            return candidate.resolve()  # retain a verified external link, never guess
         if not absolute and source_dir is not None:
             imported = Path(source_dir) / path
             if imported.is_file():
                 return imported.resolve()
-        if absolute:
-            # PureWindowsPath handles both slash styles even on other platforms.
-            name = windows.name.casefold()
-            for folder in (self.root, self.folder(kind)):
-                if folder.is_dir():
-                    matches = [p for p in folder.iterdir() if p.is_file() and p.name.casefold() == name]
-                    if len(matches) == 1:
-                        return matches[0].resolve()
         return None if foreign_windows else candidate
 
     def normalize(self, value, kind, source_dir=None):
@@ -94,6 +100,14 @@ class MediaPaths:
             return self.reference(source)
         except ValueError:
             pass
+        # Re-selecting identical audio/artwork reuses a verified local copy.
+        for directory in (self.root, self.folder(kind)):
+            if directory.is_dir():
+                for existing in sorted(directory.iterdir()):
+                    if (existing.is_file() and existing.suffix.casefold() == source.suffix.casefold()
+                            and existing.resolve().is_relative_to(self.root)
+                            and self._same_contents(source, existing)):
+                        return self.reference(existing)
         folder = self.folder(kind)
         folder.mkdir(parents=True, exist_ok=True)
         number = 1
@@ -118,6 +132,18 @@ class MediaPaths:
                 raise
             return self.reference(target)
 
+    @staticmethod
+    def _same_contents(first, second):
+        if first.stat().st_size != second.stat().st_size:
+            return False
+        with first.open("rb") as left, second.open("rb") as right:
+            while True:
+                block = left.read(1024 * 1024)
+                if block != right.read(1024 * 1024):
+                    return False
+                if not block:
+                    return True
+
 
 class WorkingLibrary:
     """Own the working location while leaving SongCollector's schema unchanged."""
@@ -127,13 +153,17 @@ class WorkingLibrary:
         self.original = self.media.root / "My Favourite Library.json"
         self.blocked = True
         self.loaded_collector = None
+        self.paths_changed = False
 
     def read(self, filename, collector_type):
         candidate = collector_type()
         candidate.load_from_file(filename)
+        self.paths_changed = False
         for song in candidate.list_songs():
+            previous = (song.filepath, song.cover_path)
             song.filepath = self.media.normalize(song.filepath, "audio", Path(filename).resolve().parent)
             song.cover_path = self.media.normalize(song.cover_path, "covers", Path(filename).resolve().parent)
+            self.paths_changed |= previous != (song.filepath, song.cover_path)
         return candidate
 
     def startup(self, collector_type):
@@ -150,7 +180,7 @@ class WorkingLibrary:
         for kind in ("audio", "covers"):
             self.media.folder(kind).mkdir(parents=True, exist_ok=True)
         self.blocked = False
-        if not self.path.exists():
+        if not self.path.exists() or self.paths_changed:
             self.save(collector)
         return collector
 
