@@ -14,7 +14,7 @@ It allows users to organize, filter, and manage music data efficiently using str
 
 ## Technologies Used
 - Python
-- Object-Oriented Programming (if you used it)
+- Object-Oriented Programming
 - File handling / data structures
 
 ## Academic Result
